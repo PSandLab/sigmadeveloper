@@ -148,5 +148,3 @@ let dev = FoveonDeveloper()
 let jpeg = try dev.render(x3f: data, to: .jpeg)
 await dev.process(jobs)
 ```# bench2
-# bench2
-# sigmadeveloper

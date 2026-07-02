@@ -1,0 +1,21 @@
+[package]
+name = "sd14raw"
+version = "0.1.0"
+edition = "2024"
+description = "foveon library"
+license = "BSD-3-Clause"
+
+[lib]
+name = "sd14raw"
+crate-type = ["staticlib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sd14raw"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

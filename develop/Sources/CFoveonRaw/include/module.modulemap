@@ -1,0 +1,4 @@
+module CFoveonRaw {
+    header "foveon_raw.h"
+    export *
+}
