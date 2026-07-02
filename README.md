@@ -148,3 +148,12 @@ let dev = FoveonDeveloper()
 let jpeg = try dev.render(x3f: data, to: .jpeg)
 await dev.process(jobs)
 ```# bench2
+
+## Credits
+
+- [vkdt](https://jo.dreggn.org/vkdt/readme.html) + [spektrafilm](https://github.com/andreavolpato/spektrafilm) for film simulations
+- [this blog too](https://yedlin.net/NerdyFilmTechStuff/DispPrepDemoFAQ/)
+- [Kalpanika/x3f](https://github.com/Kalpanika/x3f) for foveon parsing
+- [ART](https://artraweditor.github.io) for insight into certain algorithims in practice
+- [libvips](https://www.libvips.org) for general reference
+- Nafnet/NIND-denoise/restormer/various papers for restorative imaging w/ ml (denoising, deblurring, supersampling)
