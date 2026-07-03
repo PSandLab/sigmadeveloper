@@ -86,6 +86,18 @@ impl From<&RenderInfo> for FoveonInfo {
 /// calibration, ready to emit any output format.
 pub struct FoveonPrepared(crate::Prepared);
 
+/// The C `mode` values shared by [`foveon_render`] and [`foveon_emit`].
+fn render_mode(mode: u32) -> Option<RenderMode> {
+    match mode {
+        0 => Some(RenderMode::Dng),
+        1 => Some(RenderMode::TiffLinearF16),
+        2 => Some(RenderMode::TiffProxyHalf),
+        3 => Some(RenderMode::RgbaLinearF16),
+        4 => Some(RenderMode::RgbaProxyHalf),
+        _ => None,
+    }
+}
+
 /// Parse the optional NUL-terminated white-balance override.
 ///
 /// # Safety
@@ -121,8 +133,9 @@ unsafe fn deliver(
     }
 }
 
-/// Render `.x3f` bytes to DNG (`mode == 0`) or developed half-float TIFF
-/// (`mode == 1`).
+/// Render `.x3f` bytes to one output format:
+/// `0` DNG, `1` developed f16 RGB TIFF, `2` half-res proxy TIFF,
+/// `3` bare RGBA16F bitmap, `4` half-res proxy RGBA16F bitmap.
 ///
 /// `wb` is an optional NUL-terminated white-balance name (`NULL` for the
 /// as-shot value). On success returns `0`, writes the caller-owned buffer to
@@ -152,11 +165,8 @@ pub unsafe extern "C" fn foveon_render(
     let Ok(wb) = (unsafe { wb_str(wb) }) else {
         return -2;
     };
-    let mode = match mode {
-        0 => RenderMode::Dng,
-        1 => RenderMode::TiffLinearF16,
-        2 => RenderMode::TiffProxyHalf,
-        _ => return -3,
+    let Some(mode) = render_mode(mode) else {
+        return -3;
     };
     unsafe { deliver(crate::render_x3f(data, mode, wb), out_bytes, out_info) }
 }
@@ -187,7 +197,7 @@ pub unsafe extern "C" fn foveon_open(
     }
 }
 
-/// Emit DNG (`mode == 0`) or developed half-float TIFF (`mode == 1`) from a
+/// Emit one output format (same `mode` values as [`foveon_render`]) from a
 /// prepared decode. Same out-parameter contract as [`foveon_render`]. The
 /// handle is read-only here, so concurrent emits from one handle are safe.
 ///
@@ -205,11 +215,8 @@ pub unsafe extern "C" fn foveon_emit(
         return -1;
     }
     unsafe { *out_bytes = FoveonBytes::EMPTY };
-    let mode = match mode {
-        0 => RenderMode::Dng,
-        1 => RenderMode::TiffLinearF16,
-        2 => RenderMode::TiffProxyHalf,
-        _ => return -3,
+    let Some(mode) = render_mode(mode) else {
+        return -3;
     };
     let p = unsafe { &(*prepared).0 };
     unsafe { deliver(crate::emit(p, mode), out_bytes, out_info) }

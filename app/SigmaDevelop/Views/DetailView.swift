@@ -77,7 +77,7 @@ struct DetailView: View {
                         store.refreshThumbnail(item.id)
                     }
                 }
-                store.engine.releaseCache()
+                store.engine.releaseTransient()
             }
     }
 
@@ -107,6 +107,11 @@ struct DetailView: View {
                     .glassEffect(in: Circle())
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .padding(18)
+                    // Renders usually finish in a frame or two; only surface the
+                    // spinner when work persists, so quick edits never flash it.
+                    .transition(.asymmetric(
+                        insertion: .opacity.animation(.easeIn(duration: 0.12).delay(0.35)),
+                        removal: .opacity.animation(.easeOut(duration: 0.1))))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -259,25 +264,20 @@ struct DetailView: View {
 
     private func renderPreview() async {
         if !settings.hdr { previewIsHDR = false }
-
-        // Debounce rapid slider drags, but paint the first preview immediately.
-        if preview != nil {
-            try? await Task.sleep(for: .milliseconds(140))
-            guard !Task.isCancelled else { return }
-        }
-
         let renderKey = settings.renderKey
         isRendering = true
         defer {
             if settings.renderKey == renderKey { isRendering = false }
         }
         do {
-            let rendered = try await store.engine.preview(url: item.url, settings: settings, maxDimension: 2560)
-            guard !Task.isCancelled else { return }
-            preview = UIImage(cgImage: rendered.cgImage)
-            previewIsHDR = rendered.isHDR
-            autoExposureEV = rendered.autoExposureEV
-            errorText = nil
+            // X3F first paint comes from the cached proxy decode
+            for try await rendered in store.engine.previewUpdates(url: item.url, settings: settings, maxDimension: 2560) {
+                guard !Task.isCancelled else { return }
+                preview = UIImage(cgImage: rendered.cgImage)
+                previewIsHDR = rendered.isHDR
+                autoExposureEV = rendered.autoExposureEV
+                errorText = nil
+            }
         } catch {
             if !Task.isCancelled {
                 errorTitle = "Render Failed"
@@ -374,9 +374,14 @@ private struct ZoomableImage: UIViewRepresentable {
             return
         }
 
+        // A sharper render of the same photo
+        let oldSize = coordinator.imageSize
+        let aspectChanged = oldSize.height <= 0 || image.size.height <= 0
+            || abs(oldSize.width / oldSize.height - image.size.width / image.size.height) > 0.001
+
         coordinator.imageSize = image.size
         coordinator.boundsSize = scrollView.bounds.size
-        coordinator.layoutContent(in: scrollView, resetZoom: imageSizeChanged)
+        coordinator.layoutContent(in: scrollView, resetZoom: imageSizeChanged && aspectChanged)
     }
 
     final class Coordinator: NSObject, UIScrollViewDelegate {
@@ -427,8 +432,11 @@ private struct ZoomableImage: UIViewRepresentable {
         }
 
         func centerContent(in scrollView: UIScrollView) {
-            let horizontalInset = max((scrollView.bounds.width - scrollView.contentSize.width) / 2, 0)
-            let verticalInset = max((scrollView.bounds.height - scrollView.contentSize.height) / 2, 0)
+            // Floor the centring insets at the stage insets for zoom
+            let floorH = min(insetH, scrollView.bounds.width / 2)
+            let floorV = min(insetV, scrollView.bounds.height / 2)
+            let horizontalInset = max((scrollView.bounds.width - scrollView.contentSize.width) / 2, floorH)
+            let verticalInset = max((scrollView.bounds.height - scrollView.contentSize.height) / 2, floorV)
             scrollView.contentInset = UIEdgeInsets(top: verticalInset,
                                                   left: horizontalInset,
                                                   bottom: verticalInset,

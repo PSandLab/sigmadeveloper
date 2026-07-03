@@ -15,9 +15,6 @@ public struct DecodedRaw: @unchecked Sendable {
     public let height: Int
     /// `.x3f` inputs can also be exported as DNG/TIFF; others cannot.
     public let isX3F: Bool
-    /// The decode's own developed f16 TIFF bytes (x3f only) — reused verbatim for a
-    /// TIFF export so it never re-runs the Rust develop. nil for non-x3f inputs.
-    let tiffData: Data?
     /// Scene metering
     let stats: SceneStats?
     /// Top Foveon layer (blue) monochrome weights; nil for non-Foveon inputs (→ luma).
@@ -49,13 +46,23 @@ let proxyMaxDimension: CGFloat = 2560
 extension FoveonDeveloper {
 
     /// Decode `.x3f` bytes to a reusable scene-linear image
-    public func decode(x3f data: Data, proxy: Bool = false) throws -> DecodedRaw {
-        let raw = try renderX3F(data, mode: proxy ? .tiffProxyHalf : .tiffLinearF16, whiteBalance: nil)
-        guard let image = CIImage(data: raw.data, options: [
-            .colorSpace: extendedLinearSRGB, .applyOrientationProperty: true,
-        ]) else { throw FoveonError.render("could not load developed TIFF") }
-        return DecodedRaw(image: image, width: raw.width, height: raw.height, isX3F: true,
-                          tiffData: proxy ? nil : raw.data, stats: analyzeScene(of: image),
+    /// Rust core now delivers a bare RGBA16F bitmap & donor supplies cached scene analysis
+    public func decode(x3f data: Data, proxy: Bool = false, reusing donor: DecodedRaw? = nil) throws -> DecodedRaw {
+        decodedRaw(try renderX3F(data, mode: proxy ? .rgbaProxyHalf : .rgbaLinearF16, whiteBalance: nil),
+                   proxy: proxy, donor: donor)
+    }
+
+    /// Wrap a Rust RGBA16F bitmap render as a reusable scene-linear image
+    func decodedRaw(_ raw: RawRender, proxy: Bool, donor: DecodedRaw? = nil) -> DecodedRaw {
+        var image = CIImage(bitmapData: raw.data, bytesPerRow: raw.width * 8,
+                            size: CGSize(width: raw.width, height: raw.height),
+                            format: .RGBAh, colorSpace: extendedLinearSRGB)
+        if raw.orientation != 1 {
+            image = image.oriented(forExifOrientation: Int32(raw.orientation))
+        }
+        let e = image.extent.integral
+        return DecodedRaw(image: image, width: Int(e.width), height: Int(e.height), isX3F: true,
+                          stats: donor?.stats ?? analyzeScene(of: image),
                           monoWeights: raw.monoWeights, lens: LensCorrection(raw.lens), iso: raw.iso,
                           nativeScale: proxy ? 0.5 : 1)
     }
@@ -65,19 +72,19 @@ extension FoveonDeveloper {
     /// same file w/ cached scene analysis
     public func decode(file url: URL, proxy: Bool = false, reusing donor: DecodedRaw? = nil) throws -> DecodedRaw {
         if url.pathExtension.lowercased() == "x3f" {
-            return try decode(x3f: try Data(contentsOf: url), proxy: proxy)
+            return try decode(x3f: try Data(contentsOf: url), proxy: proxy, reusing: donor)
         }
         if proxy, FoveonDeveloper.isRAW(url) {
             let (image, nativeScale) = try rawProxy(url, maxDimension: proxyMaxDimension)
             let e = image.extent.integral
             return DecodedRaw(image: image, width: Int(e.width), height: Int(e.height),
-                              isX3F: false, tiffData: nil, stats: analyzeScene(of: image),
+                              isX3F: false, stats: analyzeScene(of: image),
                               monoWeights: nil, lens: nil, iso: 0, nativeScale: nativeScale)
         }
         let image = try loadLinear(url)
         let e = image.extent.integral
         return DecodedRaw(image: image, width: Int(e.width), height: Int(e.height), isX3F: false,
-                          tiffData: nil, stats: donor?.stats ?? analyzeScene(of: image),
+                          stats: donor?.stats ?? analyzeScene(of: image),
                           monoWeights: nil, lens: nil, iso: 0, nativeScale: 1)
     }
 
@@ -131,14 +138,12 @@ extension FoveonDeveloper {
 
     /// Encode a decoded image straight to the requested format's bytes. JPEG/HEIC
     /// run the finishing graph; DNG/TIFF require the original `.x3f` bytes, which
-    /// a `DecodedRaw` no longer holds — pass them via `x3f`.
+    /// a `DecodedRaw` does not hold — pass them via `x3f`.
     public func encode(_ decoded: DecodedRaw, as format: OutputFormat, options: FoveonOptions, x3f: Data? = nil) throws -> Data {
         switch format {
         case .jpeg, .heic:
             return try encode(finish(decoded, options: options), as: format, quality: options.quality)
         case .dng, .tiff:
-            // A TIFF export is exactly the decode's own developed bytes — reuse them.
-            if format == .tiff, let tiff = decoded.tiffData { return tiff }
             guard decoded.isX3F, let x3f else {
                 throw FoveonError.badInput("\(format.rawValue) output requires the original .x3f")
             }

@@ -30,7 +30,7 @@ final class LibraryStore {
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object: nil, queue: .main
         ) { [engine] _ in
-            engine.releaseCache()
+            engine.releaseAll()
         }
     }
 

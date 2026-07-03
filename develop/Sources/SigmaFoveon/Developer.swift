@@ -151,8 +151,7 @@ public final class FoveonDeveloper: @unchecked Sendable {
         case .tiff:
             return try renderX3F(x3f, mode: .tiffLinearF16, whiteBalance: nil).data
         case .jpeg, .heic:
-            let raw = try renderX3F(x3f, mode: .tiffLinearF16, whiteBalance: nil)
-            return try encode(renderImage(raw, options), as: format, quality: options.quality)
+            return try encode(finish(decode(x3f: x3f), options: options), as: format, quality: options.quality)
         }
     }
 
@@ -174,8 +173,11 @@ public final class FoveonDeveloper: @unchecked Sendable {
         if jobs.contains(where: { $0.options.denoise == .neural }) {
             defaultLimit = 1
         } else if jobs.contains(where: { FoveonDeveloper.isRAW($0.input) }) {
-            // CIRAW is GPU/ANE/Mem bound so 2-wide is fine 
+            // CIRAW is GPU/ANE/Mem bound so 2-wide is fine
             defaultLimit = 2
+        } else if jobs.contains(where: { $0.input.pathExtension.lowercased() == "x3f" }) {
+            // GPU bound again, measured for top throughput
+            defaultLimit = 4
         } else {
             defaultLimit = ProcessInfo.processInfo.activeProcessorCount
         }
@@ -230,17 +232,12 @@ public final class FoveonDeveloper: @unchecked Sendable {
             decoder = d
             return d
         }
-        var tiff: RawRender?
         var rendered: (sdr: CIImage, hdr: CIImage?)?
-        func tiffData() throws -> RawRender {
-            if let t = tiff { return t }
-            let t = try prepared().render(mode: .tiffLinearF16)
-            tiff = t
-            return t
-        }
         func renderedImage() throws -> (sdr: CIImage, hdr: CIImage?) {
             if let f = rendered { return f }
-            let f = try renderImage(tiffData(), job.options)
+            // Rendered targets take the RGBA bitmap decode
+            let f = finish(decodedRaw(try prepared().render(mode: .rgbaLinearF16), proxy: false),
+                           options: job.options)
             rendered = f
             return f
         }
@@ -249,7 +246,7 @@ public final class FoveonDeveloper: @unchecked Sendable {
             let data: Data
             switch target.format {
             case .dng:  data = try prepared().render(mode: .dng).data
-            case .tiff: data = try tiffData().data
+            case .tiff: data = try prepared().render(mode: .tiffLinearF16).data
             case .jpeg, .heic: data = try encode(renderedImage(), as: target.format, quality: job.options.quality)
             }
             try data.write(to: target.url, options: .atomic)
@@ -387,17 +384,6 @@ public final class FoveonDeveloper: @unchecked Sendable {
             ]) ?? image
         }
         return image
-    }
-
-    /// Wrap developed-TIFF bytes in a `CIImage` and build the render graph.
-    private func renderImage(_ raw: RawRender, _ o: FoveonOptions) throws -> (sdr: CIImage, hdr: CIImage?) {
-        guard let image = CIImage(data: raw.data, options: [
-            .colorSpace: extendedLinearSRGB,
-            .applyOrientationProperty: true,
-        ]) else {
-            throw FoveonError.render("could not load developed TIFF")
-        }
-        return render(image, o, isX3F: true, monoWeights: raw.monoWeights, lens: LensCorrection(raw.lens))
     }
 
     /// Encode the rendered SDR image (with an optional HDR gain-map sibling).

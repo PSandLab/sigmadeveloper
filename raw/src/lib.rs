@@ -403,9 +403,11 @@ impl Huffman {
         }
         Huffman { tree, len, val }
     }
+    /// Decode one symbol; caller must have refilled the reader since the
+    /// last 44 consumed bits: a refill banks ≥ 56, three table hits spend at
+    /// most 3 × FAST_BITS = 36, and the escape path refills itself
     #[inline]
     fn diff(&self, bs: &mut Bits) -> i32 {
-        bs.refill();
         let idx = bs.peek(FAST_BITS) as usize;
         let len = self.len[idx];
         if len != 0 {
@@ -572,6 +574,8 @@ fn decode_compressed(
         let mut c = [0i16; 3];
         let mut minimum = 0i32;
         for px in out_row.chunks_exact_mut(3) {
+            // one refill covers all three symbols
+            bs.refill();
             for (color, o) in px.iter_mut().enumerate() {
                 // int16_t accumulation with wraparound carries signed deltas
                 // encoded as the 16-bit two's-complement mapping values
@@ -1367,9 +1371,15 @@ struct Developed {
     width: usize,
     height: usize,
     orientation: u16,
-    data: Vec<u16>, // scene-linear sRGB, IEEE binary16 bits, 3 interleaved
+    /// scene-linear sRGB, little-endian IEEE binary16 bytes, channels interleaved
+    data: Vec<u8>,
+    /// samples per pixel: 3 (RGB, for the TIFF container) or 4 (RGBA, alpha = 1)
+    channels: usize,
     mono: [f32; 3],
 }
+
+/// IEEE binary16 1.0 — the alpha fill for 4-channel output.
+const HALF_ONE: u16 = 0x3c00;
 
 /// Bilinearly sample the spatial-gain grid for channel `ch` at active-area pixel `(px, py)` of a `w x h` crop
 /// grid is `sg.rows x sg.cols` with `sg.channels` channels per grid point
@@ -1489,6 +1499,7 @@ fn develop_pixel(
 /// `step` 1 develops every pixel (NEON fast path); `step` 2 emits a
 /// half-resolution proxy, box-averaging each 2×2 block of raw BMT before the
 /// same per-pixel develop — a cheap, alias-free reduction for thumbnails.
+/// `channels` 3 packs RGB (TIFF container); 4 pads alpha = 1.0
 fn develop_linear_srgb(
     raw: &Raw,
     cal: &Calibration,
@@ -1496,6 +1507,7 @@ fn develop_linear_srgb(
     area: Option<[u32; 4]>,
     orientation: u16,
     step: usize,
+    channels: usize,
 ) -> Developed {
     // BMT→XYZ is the inverse of ColorMatrix1; diag(gain) folds in white balance.
     // The neutral diagonal baked into bmt_to_xyz cancels gain for grey, so this is
@@ -1540,7 +1552,11 @@ fn develop_linear_srgb(
     let oh = h.div_ceil(step);
     let interp = sgain.map(|sg| GainInterp::new(sg, ow, oh));
     let cols = raw.columns;
-    let mut data = vec![0u16; ow * oh * 3];
+    let ch = channels;
+    // Byte buffer so the FFI can hand the allocation over as-is; the workers
+    // write through a u16 view (samples are packed little-endian below).
+    let mut data = vec![0u8; ow * oh * ch * 2];
+    assert!((data.as_ptr() as usize).is_multiple_of(align_of::<u16>()));
 
     let develop_row = |py: usize, out: &mut [u16]| {
         let y = top + py;
@@ -1580,6 +1596,7 @@ fn develop_linear_srgb(
                 let one = vdupq_n_f32(1.0);
                 let knee = vdupq_n_f32(CLIP_KNEE);
                 let span = vdupq_n_f32(1.0 - CLIP_KNEE);
+                let alpha = vdup_n_u16(HALF_ONE);
                 let quads = w / 4;
                 for q in 0..quads {
                     let px = q * 4;
@@ -1633,18 +1650,30 @@ fn develop_linear_srgb(
                     let hr = vreinterpret_u16_f16(vcvt_f16_f32(rr));
                     let hg = vreinterpret_u16_f16(vcvt_f16_f32(rg));
                     let hb = vreinterpret_u16_f16(vcvt_f16_f32(rb));
-                    vst3_u16(out.as_mut_ptr().add(px * 3), uint16x4x3_t(hr, hg, hb));
+                    if ch == 4 {
+                        vst4_u16(out.as_mut_ptr().add(px * 4), uint16x4x4_t(hr, hg, hb, alpha));
+                    } else {
+                        vst3_u16(out.as_mut_ptr().add(px * 3), uint16x4x3_t(hr, hg, hb));
+                    }
                 }
                 // Finish the < 4 pixel remainder with the scalar kernel.
                 for px in quads * 4..w {
                     let h = develop_pixel(&src[px * 3..], gain(px), &black32, &scale32, &m32);
-                    out[px * 3..px * 3 + 3].copy_from_slice(&h);
+                    out[px * ch..px * ch + 3].copy_from_slice(&h);
+                    if ch == 4 {
+                        out[px * ch + 3] = HALF_ONE;
+                    }
                 }
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
-        for (px, (s, o)) in src.chunks_exact(3).zip(out.chunks_exact_mut(3)).enumerate() {
-            o.copy_from_slice(&develop_pixel(s, gain(px), &black32, &scale32, &m32));
+        for (px, (s, o)) in src.chunks_exact(3).zip(out.chunks_exact_mut(ch)).enumerate() {
+            let h = develop_pixel(s, gain(px), &black32, &scale32, &m32);
+            // Samples are declared little-endian
+            o[..3].copy_from_slice(&h.map(u16::to_le));
+            if ch == 4 {
+                o[3] = HALF_ONE.to_le();
+            }
         }
     };
 
@@ -1665,7 +1694,7 @@ fn develop_linear_srgb(
                 _ => None,
             }
         };
-        for (px, o) in out.chunks_exact_mut(3).enumerate() {
+        for (px, o) in out.chunks_exact_mut(ch).enumerate() {
             let x0 = left + px * step;
             let x1 = (x0 + step - 1).min(left + w - 1);
             let avg: [u16; 3] = std::array::from_fn(|c| {
@@ -1675,12 +1704,16 @@ fn develop_linear_srgb(
                     + raw.data[3 * (y1 * cols + x1) + c] as u32;
                 (s / 4) as u16
             });
-            o.copy_from_slice(&develop_pixel(&avg, gain(px), &black32, &scale32, &m32));
+            let h = develop_pixel(&avg, gain(px), &black32, &scale32, &m32);
+            o[..3].copy_from_slice(&h.map(u16::to_le));
+            if ch == 4 {
+                o[3] = HALF_ONE.to_le();
+            }
         }
     };
 
-    let stride = ow * 3;
-    let base = SyncPtr(data.as_mut_ptr());
+    let stride = ow * ch;
+    let base = SyncPtr(data.as_mut_ptr().cast::<u16>());
     // Output rows are independent; the shared atomic cursor lets P-cores out-pace
     // E-cores instead of every core waiting on a fixed equal band.
     parallel_rows(oh, ROW_CHUNK, |py| {
@@ -1699,6 +1732,7 @@ fn develop_linear_srgb(
         height: oh,
         orientation,
         data,
+        channels: ch,
         mono,
     }
 }
@@ -2099,7 +2133,8 @@ fn pack_rgb_f16(rgb: [f32; 3]) -> [u16; 3] {
 }
 
 fn write_tiff_linear_f16<W: Write>(dev: &Developed, w: &mut W) -> std::io::Result<()> {
-    let bytes = (dev.data.len() * 2) as u32;
+    debug_assert_eq!(dev.channels, 3, "TIFF output is 3-sample RGB");
+    let bytes = dev.data.len() as u32;
     let mut ifd: Vec<Field> = vec![
         Field::long(256, dev.width as u32),
         Field::long(257, dev.height as u32),
@@ -2140,17 +2175,8 @@ fn write_tiff_linear_f16<W: Write>(dev: &Developed, w: &mut W) -> std::io::Resul
     header[8..8 + ifd_bytes.len()].copy_from_slice(&ifd_bytes);
     header[heap_off as usize..heap_off as usize + heap.len()].copy_from_slice(&heap);
     w.write_all(&header)?;
-    if cfg!(target_endian = "little") {
-        // SAFETY: `u16` has no padding or invalid bit patterns, so the slice
-        // reinterprets cleanly as its native little-endian bytes.
-        let (_, samples, _) = unsafe { dev.data.align_to::<u8>() };
-        w.write_all(samples)
-    } else {
-        for &v in &dev.data {
-            w.write_all(&v.to_le_bytes())?;
-        }
-        Ok(())
-    }
+    // The raster is already little-endian
+    w.write_all(&dev.data)
 }
 
 // Public library API (used by the C FFI in `ffi.rs` and the CLI below)
@@ -2245,6 +2271,12 @@ pub enum RenderMode {
     /// Half-resolution proxy of the developed TIFF (2×2 raw box average) —
     /// thumbnails and scene analysis at a quarter of the develop cost.
     TiffProxyHalf,
+    /// Bare interleaved RGBA16F scene-linear pixels (alpha = 1, no container)
+    /// a Core Image bitmap with zero encode/parse overhead. Dimensions travel
+    /// in [`RenderInfo`]; orientation is the caller's to apply.
+    RgbaLinearF16,
+    /// Half-resolution proxy of the RGBA16F bitmap (2×2 raw box average)
+    RgbaProxyHalf,
 }
 
 /// Dimensions and metadata of a rendered image (handed back across the FFI).
@@ -2280,23 +2312,28 @@ fn emit(p: &Prepared, mode: RenderMode) -> R<(Vec<u8>, RenderInfo)> {
             p.raw.rows as u32,
             REC709_LUMA,
         ),
-        RenderMode::TiffLinearF16 | RenderMode::TiffProxyHalf => {
-            let step = if mode == RenderMode::TiffProxyHalf {
-                2
-            } else {
-                1
-            };
+        RenderMode::TiffLinearF16
+        | RenderMode::TiffProxyHalf
+        | RenderMode::RgbaLinearF16
+        | RenderMode::RgbaProxyHalf => {
+            let proxy = matches!(mode, RenderMode::TiffProxyHalf | RenderMode::RgbaProxyHalf);
+            let bitmap = matches!(mode, RenderMode::RgbaLinearF16 | RenderMode::RgbaProxyHalf);
             let dev = develop_linear_srgb(
                 &p.raw,
                 &p.cal,
                 p.sgain.as_ref(),
                 p.area,
                 p.orientation,
-                step,
+                if proxy { 2 } else { 1 },
+                if bitmap { 4 } else { 3 },
             );
-            let mut v = Vec::with_capacity(dev.data.len() * 2 + 256);
-            write_tiff_linear_f16(&dev, &mut v).map_err(|e| e.to_string())?;
-            (v, dev.width as u32, dev.height as u32, dev.mono)
+            if bitmap {
+                (dev.data, dev.width as u32, dev.height as u32, dev.mono)
+            } else {
+                let mut v = Vec::with_capacity(dev.data.len() + 256);
+                write_tiff_linear_f16(&dev, &mut v).map_err(|e| e.to_string())?;
+                (v, dev.width as u32, dev.height as u32, dev.mono)
+            }
         }
     };
     Ok((
@@ -2362,7 +2399,8 @@ fn run(input: &Path, output: &Path, override_wb: Option<String>) -> R<()> {
             .map_err(|e| format!("cannot write {}: {e}", output.display()))?;
         (p.raw.columns, p.raw.rows)
     } else {
-        let dev = develop_linear_srgb(&p.raw, &p.cal, p.sgain.as_ref(), p.area, p.orientation, 1);
+        let dev =
+            develop_linear_srgb(&p.raw, &p.cal, p.sgain.as_ref(), p.area, p.orientation, 1, 3);
         lap("develop");
         let file = std::fs::File::create(output)
             .map_err(|e| format!("cannot write {}: {e}", output.display()))?;

@@ -34,9 +34,11 @@ struct DevelopControls: View {
             .disabled(settings.hdr)
 
             if settings.autoTone {
-                Divider()
-
-                AutoExposureModeControl(mode: $settings.autoExposureMode)
+                Group {
+                    Divider()
+                    AutoExposureModeControl(mode: $settings.autoExposureMode)
+                }
+                .transition(.opacity)
             }
 
             Divider()
@@ -45,7 +47,6 @@ struct DevelopControls: View {
                           accessory: autoToneAccessory) {
                 String(format: "%+.1f EV", $0)
             }
-            .animation(.snappy(duration: 0.28), value: settings.autoTone)
 
             Divider()
 
@@ -86,6 +87,10 @@ struct DevelopControls: View {
         .font(.body)
         .foregroundStyle(SigmaTheme.ink)
         .tint(SigmaTheme.ink)
+        // One transaction animates the disclosure, the accessory fade, and the
+        // rows sliding — concurrently, so hiding never waits on a stage.
+        .animation(.snappy(duration: 0.28), value: settings.autoTone)
+        .animation(.snappy(duration: 0.28), value: autoExposureEV)
         .onAppear {
             if settings.hdr && !settings.autoTone {
                 settings.autoTone = true

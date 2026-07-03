@@ -5,6 +5,8 @@ enum RawMode: UInt32 {
     case dng = 0
     case tiffLinearF16 = 1
     case tiffProxyHalf = 2
+    case rgbaLinearF16 = 3
+    case rgbaProxyHalf = 4
 }
 
 struct RawRender {

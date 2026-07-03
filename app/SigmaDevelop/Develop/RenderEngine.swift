@@ -18,8 +18,16 @@ final class RenderEngine: @unchecked Sendable {
     private let developer = FoveonDeveloper()
     // handle QoS properly or else XCode gets made at me
     private let queue = DispatchQueue(label: "global.sigma.render", qos: .default)
-    /// Thumbnails queue
-    private let thumbnailQueue = DispatchQueue(label: "global.sigma.render.thumbnails", qos: .utility)
+    /// bound CPU thumbnails as CIRAW proxy decode is GPU bound
+    private let thumbnailQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "global.sigma.render.thumbnails"
+        queue.maxConcurrentOperationCount = 2
+        queue.qualityOfService = .default
+        return queue
+    }()
+    /// Newest preview request
+    private let previewGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
 
     private struct DecodeKey: Equatable, Sendable {
         let path: String
@@ -51,7 +59,7 @@ final class RenderEngine: @unchecked Sendable {
     /// Small grid thumbnail, developed with `settings` so the gallery matches the
     /// editor and the export.
     func thumbnail(url: URL, settings: DevelopSettings, maxDimension: Int) async throws -> RenderedImage {
-        try await run(on: thumbnailQueue) {
+        try await runThumbnail {
             var options = settings.foveonOptions()
             // only allow wavelet
             if options.denoise == .neural { options.denoise = .off }
@@ -69,28 +77,58 @@ final class RenderEngine: @unchecked Sendable {
 
     func downscale(_ image: RenderedImage, maxDimension: Int) async -> RenderedImage {
         await withCheckedContinuation { continuation in
-            thumbnailQueue.async {
+            thumbnailQueue.addOperation {
                 continuation.resume(returning: RenderedImage(cgImage: Self.resample(image.cgImage, to: maxDimension)))
             }
         }
     }
 
-    /// Full-quality on-screen preview honouring `settings`, downscaled to
-    /// `maxDimension` for speed. Reuses the cached decode + denoise when only the
-    /// cheaper finishing knobs changed.
-    func preview(url: URL, settings: DevelopSettings, maxDimension: Int?) async throws -> RenderedImage {
-        try await run {
-            let options = settings.foveonOptions()
-            // Camera RAW edits from the rasterised proxy
-            let developed = try self.developCached(url: url, options: options,
-                                                   proxy: Self.isProxyPreviewed(url))
-            guard let cg = self.developer.previewImage(developed, options: options,
-                                                       maxDimension: maxDimension) else {
-                throw FoveonError.render("preview render returned nil")
+    /// Full-quality on-screen preview honouring settings, downscaled to
+    /// `maxDimension` for speed, delivered progressively
+    /// Superseded requests are dropped before rendering, so it converges on current
+    func previewUpdates(url: URL, settings: DevelopSettings, maxDimension: Int?) -> AsyncThrowingStream<RenderedImage, Error> {
+        let generation = previewGeneration.withLock { g in g += 1; return g }
+        return AsyncThrowingStream { continuation in
+            self.queue.async {
+                guard self.isCurrentPreview(generation) else { return continuation.finish() }
+                do {
+                    let options = settings.foveonOptions()
+                    // Camera RAW edits from the rasterised proxy
+                    let proxyPreviewed = Self.isProxyPreviewed(url)
+                    if !proxyPreviewed, !self.hasCachedDecode(url: url, proxy: false),
+                       let quick = try? self.renderPreview(url: url, options: options,
+                                                           proxy: true, maxDimension: maxDimension) {
+                        continuation.yield(quick)
+                        guard self.isCurrentPreview(generation) else { return continuation.finish() }
+                    }
+                    continuation.yield(try self.renderPreview(url: url, options: options,
+                                                              proxy: proxyPreviewed,
+                                                              maxDimension: maxDimension))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
             }
-            let isHDR = options.hdr && (cg.colorSpace.map(CGColorSpaceUsesExtendedRange) ?? false)
-            return RenderedImage(cgImage: cg, autoExposureEV: developed.autoExposureEV, isHDR: isHDR)
         }
+    }
+
+    private func renderPreview(url: URL, options: FoveonOptions, proxy: Bool, maxDimension: Int?) throws -> RenderedImage {
+        let developed = try developCached(url: url, options: options, proxy: proxy)
+        guard let cg = developer.previewImage(developed, options: options,
+                                              maxDimension: maxDimension) else {
+            throw FoveonError.render("preview render returned nil")
+        }
+        let isHDR = options.hdr && (cg.colorSpace.map(CGColorSpaceUsesExtendedRange) ?? false)
+        return RenderedImage(cgImage: cg, autoExposureEV: developed.autoExposureEV, isHDR: isHDR)
+    }
+
+    private func isCurrentPreview(_ generation: UInt64) -> Bool {
+        previewGeneration.withLock { $0 == generation }
+    }
+
+    private func hasCachedDecode(url: URL, proxy: Bool) -> Bool {
+        let key = DecodeKey(path: url.path, proxy: proxy)
+        return decodeCache.withLock { cache in cache.contains { $0.key == key } }
     }
 
     /// Encode `url` to the requested format and write it off the main actor.
@@ -127,9 +165,14 @@ final class RenderEngine: @unchecked Sendable {
         }
     }
 
-    /// Drop the cached decodes + denoise when leaving a viewer or udnder mem pressure
-    func releaseCache() {
+    /// consider mem pressure
+    func releaseAll() {
         decodeCache.withLock { $0.removeAll() }
+        releaseTransient()
+    }
+
+    /// when leaving we weant to drop graph/gpu but keep MRU
+    func releaseTransient() {
         queue.async {
             self.developKey = nil; self.developed = nil
             self.developer.releaseTransientResources()
@@ -190,10 +233,9 @@ final class RenderEngine: @unchecked Sendable {
     private func exportData(url: URL, settings: DevelopSettings, format: ExportFormat) throws -> Data {
         let options = settings.foveonOptions()
         switch format {
-        case .dng:
-            return try developer.render(x3f: try Data(contentsOf: url), to: .dng, options: options)
-        case .tiff:
-            return try developer.encode(decodeCached(url: url, proxy: false), as: .tiff, options: options)
+        case .dng, .tiff:
+            // Container formats come straight from the Rust core.
+            return try developer.render(x3f: try Data(contentsOf: url), to: format.outputFormat, options: options)
         case .heic, .jpeg:
             guard Self.isProxyPreviewed(url) else {
                 // X3F previews develop full-res, so the export reuses that work
@@ -230,10 +272,15 @@ final class RenderEngine: @unchecked Sendable {
         return context.makeImage() ?? image
     }
 
-    private func run<T: Sendable>(on queue: DispatchQueue? = nil,
-                                  _ work: @escaping @Sendable () throws -> T) async throws -> T {
+    private func run<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { cont in
-            (queue ?? self.queue).async { cont.resume(with: Result { try work() }) }
+            queue.async { cont.resume(with: Result { try work() }) }
+        }
+    }
+
+    private func runThumbnail<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { cont in
+            thumbnailQueue.addOperation { cont.resume(with: Result { try work() }) }
         }
     }
 }
