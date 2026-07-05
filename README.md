@@ -4,7 +4,7 @@ Develop Sigma SD9 / SD10 / SD14 Foveon X3F raws into DNG/TIFF -> JPEG/HEIC +
 - auto exposure/wb/etc. methods
 - primitive HDR
 - ml-assisted debayering & denoising for 3rd party raw files
-- ml framework for regenerative image models
+- ml framework for assisted editing
 
 ## iOS app
 
