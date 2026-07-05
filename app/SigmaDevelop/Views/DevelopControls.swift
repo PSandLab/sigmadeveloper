@@ -1,34 +1,58 @@
 import SwiftUI
 import SigmaFoveon
 
-/// Centralise timing
-private let disclosureAnimation = Animation.smooth(duration: 0.28)
+private let disclosureAnimation = Animation.spring(response: 0.32, dampingFraction: 0.86)
+private func revealAnimation(forHeight distance: CGFloat) -> Animation {
+    .spring(response: min(0.5, 0.3 + distance / 3800), dampingFraction: 0.86)
+}
 
-/// Reveals `content` by animating its measured height under a clip: rows below
-/// are pushed apart / pulled together by the height itself, top-anchored, so an
-/// opening menu unrolls downward and can never draw over its neighbours.
-/// The min/max width frame pins the row to the proposed width, so hidden rows
-/// (long stock-menu labels) can never inflate the panel sideways.
 private struct Disclosure<Content: View>: View {
     var shown: Bool
     @ViewBuilder var content: Content
 
-    @State private var contentHeight: CGFloat?
+    @State private var measured: CGFloat = 0
+    @State private var height: CGFloat?
+
+    init(shown: Bool, @ViewBuilder content: () -> Content) {
+        self.shown = shown
+        self.content = content()
+        _height = State(initialValue: shown ? nil : 0) // adopt initial state, no opening animation
+    }
 
     var body: some View {
         VStack(spacing: 0) { content }
             .fixedSize(horizontal: false, vertical: true)
+            // Pin to the proposed width so hidden rows (long stock-menu labels) can't
+            // inflate the panel sideways.
             .frame(minWidth: 0, maxWidth: .infinity)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
-            .frame(height: shown ? contentHeight : 0, alignment: .top)
-            .clipped()
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { measured = $0 }
+            .frame(height: height, alignment: .top)
+            // Clip the *height* only. `.clipped()` also trims the horizontal bounds,
+            // shaving the trailing edge of flush controls (Toggle switch, segmented
+            // track) — visible on these clipped rows but not the unclipped top-level
+            // ones. The over-hanging mask keeps the height clip (an opening menu still
+            // can't draw over its neighbours) while leaving the sides untouched.
+            .mask(alignment: .top) { Rectangle().padding(.horizontal, -40) }
             // Reveal purely by unmasking height (like a native List/Form insertion).
             // No opacity cross-fade: fading the already-unclipped rows makes them
-            // ghost in from the top instead of unrolling solid. The 0-height clip
-            // already hides the content; hit-testing/VoiceOver are gated below.
+            // ghost in from the top instead of unrolling solid.
             .allowsHitTesting(shown)
             .accessibilityHidden(!shown)
-            .animation(disclosureAnimation, value: shown)
+            .onChange(of: shown) { _, nowShown in
+                if nowShown {
+                    // Unroll 0 → content height, then hand sizing back to the content.
+                    withAnimation(revealAnimation(forHeight: measured)) { height = measured } completion: {
+                        if shown { height = nil }
+                    }
+                } else {
+                    // A frame can't animate away from `nil`, so pin the live height for
+                    // one pass (no visible change — it equals the natural height), then
+                    // roll it up to 0.
+                    withAnimation(.linear(duration: 0)) { height = measured } completion: {
+                        withAnimation(revealAnimation(forHeight: measured)) { height = 0 }
+                    }
+                }
+            }
     }
 }
 
