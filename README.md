@@ -1,8 +1,33 @@
-Develop Sigma SD9 / SD10 / SD14 Foveon X3F raws into DNG/TIFF -> JPEG/HEIC
+Develop Sigma SD9 / SD10 / SD14 Foveon X3F raws into DNG/TIFF -> JPEG/HEIC +
 
-- `raw/` — raw proccessing & calibration library
-- `develop/` — coreimage wrapper
-- `app/` — iOS app: ingest X3F/RAW from a USB-C drive, develop + live re-render (see `app/README.md`)
+- physically modeled, graphically accelerated film sims
+- auto exposure/wb/etc. methods
+- primitive HDR
+- ml-assisted debayering & denoising for 3rd party raw files
+- ml framework for regenerative image models
+
+## iOS app
+
+<img width="300" alt="IMG_0802" src="https://github.com/user-attachments/assets/5029eee9-fbc0-44ce-a1cb-7c76f11bd43c" />
+<img width="300" alt="IMG_0801" src="https://github.com/user-attachments/assets/c1b14716-50a3-41cf-bcae-8c1389d001d6" />
+<img width="300" alt="IMG_0805" src="https://github.com/user-attachments/assets/9b062456-7899-44a5-812e-8e5e66115043" />
+<img width="900" alt="IMG_0773" src="https://github.com/user-attachments/assets/08965b11-17a6-4369-a97d-3060423ca87d" />
+
+## film simulation
+
+<img width="300" alt="IMG_0754" src="https://github.com/user-attachments/assets/8c76bede-172c-466f-abaf-2ede536a661f" />
+<img width="300" alt="IMG_0807" src="https://github.com/user-attachments/assets/0f434b44-e7b1-4c38-b339-cab5a42afb4b" />
+<img width="300" alt="IMG_0808" src="https://github.com/user-attachments/assets/c867436c-4cd9-42b2-9b3d-95b138a1a655" />
+<img width="300" alt="IMG_0809" src="https://github.com/user-attachments/assets/7f831a87-1984-4e0c-8047-266ba6a90f45" />
+
+## foveon profiled denoising
+
+<img width="300" alt="IMG_0758 2" src="https://github.com/user-attachments/assets/59949d36-eba8-4f49-ab30-7a5e687d0c2a" />
+<img width="300" alt="IMG_0759 2" src="https://github.com/user-attachments/assets/f4b41809-25a1-4e0e-8a9a-65438c3200cf" />
+
+## 3rd party raw editing
+
+<img width="150" alt="IMG_0772" src="https://github.com/user-attachments/assets/2a2dccc1-be71-4bbd-903b-ab035b142882" />
 
 Various industry raw files are also supported, through apple's raw library, & using Raw9 on iOS/macOS 27 w/ ML assisted denoising & debayering. This is however beta software & a lower priority than the foveon path, & may be buggy! Not that the foveon path is bug-free...
 
