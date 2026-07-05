@@ -23,7 +23,7 @@ let foveonMetalLibrary: Data? = {
         ?? Bundle.module.url(forResource: name, withExtension: "metallib"),
         let data = try? Data(contentsOf: url)
     else {
-        FileHandle.standardError.write(Data("foveon: finishing metallib '\(name)' missing\n".utf8))
+        warnStderr("finishing metallib '\(name)' missing")
         return nil
     }
     return data

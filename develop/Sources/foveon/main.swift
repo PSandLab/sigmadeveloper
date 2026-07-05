@@ -115,13 +115,29 @@ while i < args.count {
         defer { i += 1 }
         return args[i]
     }
+    // Fail fast on a malformed numeric values
+    func takeFloat() -> Float {
+        let v = take()
+        guard let f = Float(v) else { fail("\(a) expects a number, got '\(v)'") }
+        return f
+    }
+    func takeDouble() -> Double {
+        let v = take()
+        guard let d = Double(v) else { fail("\(a) expects a number, got '\(v)'") }
+        return d
+    }
+    func takeInt() -> Int {
+        let v = take()
+        guard let n = Int(v) else { fail("\(a) expects an integer, got '\(v)'") }
+        return n
+    }
     switch a {
     case "--dng": formats.append(.dng)
     case "--tiff": formats.append(.tiff)
     case "--jpeg", "--jpg": formats.append(.jpeg)
     case "--heic": formats.append(.heic)
     case "-o", "--out": outDir = URL(fileURLWithPath: take(), isDirectory: true)
-    case "-q", "--quality": options.quality = Double(take()) ?? options.quality
+    case "-q", "--quality": options.quality = takeDouble()
     case "--wb":
         let v = take().lowercased()
         switch v {
@@ -134,19 +150,19 @@ while i < args.count {
             options.wb = .temperature(kelvin: k, tint: 0)
         }
     case "--no-lens-correction": options.lensCorrection = false
-    case "--exposure": options.exposure = Float(take()) ?? options.exposure
+    case "--exposure": options.exposure = takeFloat()
     case "--no-auto-tone": options.autoTone = false
     case "--auto-exposure":
         guard let m = AutoExposureMode(rawValue: take().lowercased()) else {
             fail("--auto-exposure expects ettr | key")
         }
         options.autoExposureMode = m
-    case "--tone-key": options.toneKey = Float(take()) ?? options.toneKey
+    case "--tone-key": options.toneKey = takeFloat()
     case "--monochrom": options.monochrome = true
-    case "--contrast": options.contrast = Float(take())
-    case "--sharpness": options.sharpness = Float(take()) ?? options.sharpness
+    case "--contrast": options.contrast = takeFloat()
+    case "--sharpness": options.sharpness = takeFloat()
     case "--sdr": options.hdr = false
-    case "--hdr-stops": options.hdrEV = Float(take()) ?? options.hdrEV
+    case "--hdr-stops": options.hdrEV = takeFloat()
     case "--film":
         let v = take()
         if v.lowercased() == "list" { printStocks(); exit(0) }
@@ -157,16 +173,16 @@ while i < args.count {
         film.paper = resolveStock(take(), in: FilmSimData.papers, kind: "paper")
         film.negative = false                                     // an explicit paper means print
     case "--film-negative": film.negative = true
-    case "--ev-film": film.evFilm = Float(take()) ?? film.evFilm
-    case "--ev-paper": film.evPaper = Float(take())
-    case "--couplers": film.couplers = Float(take()) ?? film.couplers
-    case "--coupler-radius": film.couplersRadius = Float(take()) ?? film.couplersRadius
+    case "--ev-film": film.evFilm = takeFloat()
+    case "--ev-paper": film.evPaper = takeFloat()
+    case "--couplers": film.couplers = takeFloat()
+    case "--coupler-radius": film.couplersRadius = takeFloat()
     case "--halation": film.halation = true
-    case "--halation-strength": film.halationStrength = Float(take()) ?? film.halationStrength; film.halation = true
-    case "--halation-radius": film.halationRadius = Float(take()) ?? film.halationRadius; film.halation = true
-    case "--halation-midtones": film.halationMidtones = Float(take()) ?? film.halationMidtones; film.halation = true
+    case "--halation-strength": film.halationStrength = takeFloat(); film.halation = true
+    case "--halation-radius": film.halationRadius = takeFloat(); film.halation = true
+    case "--halation-midtones": film.halationMidtones = takeFloat(); film.halation = true
     case "--no-grain": film.grain = false
-    case "--grain-size": film.grainSize = Float(take()) ?? film.grainSize
+    case "--grain-size": film.grainSize = takeFloat()
     case "--denoise":
         // Optional mode value; a bare --denoise takes the traditional path.
         if i < args.count, let mode = DenoiseMode(rawValue: args[i].lowercased()) {
@@ -176,15 +192,15 @@ while i < args.count {
             options.denoise = .wavelet
         }
     case "--denoise-strength":
-        if let v = Float(take()) { options.denoiseStrength = v }
+        options.denoiseStrength = takeFloat()
         if options.denoise == .off { options.denoise = .wavelet }
     case "--denoise-chroma":
-        options.denoiseChroma = Float(take()) ?? options.denoiseChroma
+        options.denoiseChroma = takeFloat()
         if options.denoise == .off { options.denoise = .wavelet }
     case "--denoise-model": options.denoiseModels.append(URL(fileURLWithPath: take())); options.denoise = .neural
-    case "--denoise-time": options.denoiseTime = Float(take()) ?? options.denoiseTime; options.denoise = .neural
+    case "--denoise-time": options.denoiseTime = takeFloat(); options.denoise = .neural
     case "--denoise-ensemble": options.denoiseEnsemble = true; options.denoise = .neural
-    case "-j", "--jobs": jobsLimit = Int(take())
+    case "-j", "--jobs": jobsLimit = takeInt()
     case "-h", "--help": print(usage); exit(0)
     default:
         if a.hasPrefix("-") { fail("unknown option \(a)") }
@@ -202,7 +218,10 @@ formats = formats.filter { seen.insert($0).inserted }
 
 let files = collectInputs(inputs)
 guard !files.isEmpty else { fail("no input files found") }
-if let outDir { try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true) }
+if let outDir {
+    do { try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true) }
+    catch { fail("cannot create output directory \(outDir.path): \(error.localizedDescription)") }
+}
 
 let jobs = files.map { input -> FoveonJob in
     let dir = outDir ?? input.deletingLastPathComponent()

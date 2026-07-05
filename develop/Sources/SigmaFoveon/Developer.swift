@@ -54,6 +54,7 @@ public struct FoveonOptions: Sendable {
     public var hdr = true                    // embed an ISO HDR gain map
     public var hdrEV: Float = 2.3            // highlight headroom in stops @ white
     public var wb: WhiteBalanceMode = .asShot // post-decode white balance
+    public var rotate = 0                    // quarter-turns clockwise
     public var lensCorrection = true         // profile-driven distortion/CA/vignette (x3f)
     public var film: FilmSimSettings? = nil  // spectral film simulation (nil → off)
     public var denoise: DenoiseMode = .off   // wavelet (profiled) or neural (Core ML)
@@ -99,6 +100,8 @@ public final class FoveonDeveloper: @unchecked Sendable {
         var denoisers: [String: FoveonDenoiser] = [:]
         var badKeys: Set<String> = []
         var warnedNoModel = false
+        /// can 'foveondenoiser.discover``
+        var discovered: [URL]? = nil
     }
 
     public init() {
@@ -109,12 +112,22 @@ public final class FoveonDeveloper: @unchecked Sendable {
     /// denoising is off or no model is available. Shared across concurrent jobs.
     func denoiser(for o: FoveonOptions) -> FoveonDenoiser? {
         guard o.denoise == .neural else { return nil }
-        let urls = o.denoiseModels.isEmpty ? FoveonDenoiser.discover() : o.denoiseModels
+        let urls: [URL]
+        if o.denoiseModels.isEmpty {
+            urls = denoiserState.withLock { state in
+                if let cached = state.discovered { return cached }
+                let found = FoveonDenoiser.discover()
+                state.discovered = found
+                return found
+            }
+        } else {
+            urls = o.denoiseModels
+        }
         guard !urls.isEmpty else {
             denoiserState.withLock { state in
                 if !state.warnedNoModel {
                     state.warnedNoModel = true
-                    FileHandle.standardError.write(Data("foveon: --denoise set but no Core ML model found (pass --denoise-model, or place FoveonJiT.mlpackage beside the binary / in the app bundle)\n".utf8))
+                    warnStderr("--denoise set but no Core ML model found (pass --denoise-model, or place FoveonJiT.mlpackage beside the binary / in the app bundle)")
                 }
             }
             return nil
@@ -129,7 +142,7 @@ public final class FoveonDeveloper: @unchecked Sendable {
                 return made
             } catch {
                 state.badKeys.insert(key)
-                FileHandle.standardError.write(Data("foveon: failed to load denoise model(s): \(key): \(error)\n".utf8))
+                warnStderr("failed to load denoise model(s): \(key): \(error)")
                 return nil
             }
         }
@@ -147,9 +160,9 @@ public final class FoveonDeveloper: @unchecked Sendable {
         // white balance is a post-decode finishing adjustment (see `options.wb`).
         switch format {
         case .dng:
-            return try renderX3F(x3f, mode: .dng, whiteBalance: nil).data
+            return try renderX3F(x3f, mode: .dng).data
         case .tiff:
-            return try renderX3F(x3f, mode: .tiffLinearF16, whiteBalance: nil).data
+            return try renderX3F(x3f, mode: .tiffLinearF16).data
         case .jpeg, .heic:
             return try encode(finish(decode(x3f: x3f), options: options), as: format, quality: options.quality)
         }
@@ -394,14 +407,12 @@ public final class FoveonDeveloper: @unchecked Sendable {
 
         switch format {
         case .jpeg:
-            let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
-            guard let data = context.jpegRepresentation(of: rendered.sdr, colorSpace: sRGB, options: options) else {
+            guard let data = context.jpegRepresentation(of: rendered.sdr, colorSpace: sRGBColorSpace, options: options) else {
                 throw FoveonError.render("JPEG encode returned nil")
             }
             return data
         case .heic:
-            let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
-            return try context.heif10Representation(of: rendered.sdr, colorSpace: p3, options: options)
+            return try context.heif10Representation(of: rendered.sdr, colorSpace: displayP3ColorSpace, options: options)
         case .dng, .tiff:
             throw FoveonError.render("\(format.rawValue) is not a rendered image format")
         }
@@ -422,6 +433,8 @@ public final class FoveonDeveloper: @unchecked Sendable {
             .cacheIntermediates: false,
             .workingColorSpace: extendedLinearSRGB,
             .workingFormat: CIFormat.RGBAh,
+            // Renders yield the GPU to UI animation instead of starving it
+            .priorityRequestLow: true,
         ]
         if let device = MTLCreateSystemDefaultDevice() {
             return CIContext(mtlDevice: device, options: options)

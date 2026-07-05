@@ -1,10 +1,59 @@
 import SwiftUI
 import SigmaFoveon
 
+/// Centralise timing
+private let disclosureAnimation = Animation.smooth(duration: 0.28)
+
+/// Reveals `content` by animating its measured height under a clip: rows below
+/// are pushed apart / pulled together by the height itself, top-anchored, so an
+/// opening menu unrolls downward and can never draw over its neighbours.
+/// The min/max width frame pins the row to the proposed width, so hidden rows
+/// (long stock-menu labels) can never inflate the panel sideways.
+private struct Disclosure<Content: View>: View {
+    var shown: Bool
+    @ViewBuilder var content: Content
+
+    @State private var contentHeight: CGFloat?
+
+    var body: some View {
+        VStack(spacing: 0) { content }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(minWidth: 0, maxWidth: .infinity)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+            .frame(height: shown ? contentHeight : 0, alignment: .top)
+            .clipped()
+            // Reveal purely by unmasking height (like a native List/Form insertion).
+            // No opacity cross-fade: fading the already-unclipped rows makes them
+            // ghost in from the top instead of unrolling solid. The 0-height clip
+            // already hides the content; hit-testing/VoiceOver are gated below.
+            .allowsHitTesting(shown)
+            .accessibilityHidden(!shown)
+            .animation(disclosureAnimation, value: shown)
+    }
+}
+
+/// Disabled rows dim like native controls
+/// Applied per leaf row so nested containers never double-dim
+private struct DisabledRowStyle: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(isEnabled ? 1 : 0.4)
+            .animation(disclosureAnimation, value: isEnabled)
+    }
+}
+
+private extension View {
+    func disabledRowStyle() -> some View { modifier(DisabledRowStyle()) }
+}
+
 struct DevelopControls: View {
     @Binding var settings: DevelopSettings
     var isX3F: Bool = true
     var autoExposureEV: Float? = nil
+    /// A correction profile matched lens via X3F
+    var lensCorrectionAvailable: Bool = true
 
     @State private var hdrEnabledAutoTone = false
 
@@ -17,7 +66,8 @@ struct DevelopControls: View {
             DenoiseControl(mode: $settings.denoise,
                            strength: $settings.denoiseStrength,
                            chroma: $settings.denoiseChroma,
-                           time: $settings.denoiseTime)
+                           time: $settings.denoiseTime,
+                           supported: isX3F)
                 .disabled(!isX3F)
 
             Divider()
@@ -33,12 +83,9 @@ struct DevelopControls: View {
             }
             .disabled(settings.hdr)
 
-            if settings.autoTone {
-                Group {
-                    Divider()
-                    AutoExposureModeControl(mode: $settings.autoExposureMode)
-                }
-                .transition(.opacity)
+            Disclosure(shown: settings.autoTone) {
+                Divider()
+                AutoExposureModeControl(mode: $settings.autoExposureMode)
             }
 
             Divider()
@@ -48,12 +95,12 @@ struct DevelopControls: View {
                 String(format: "%+.1f EV", $0)
             }
 
-            Divider()
-
-            LabeledSlider("HDR headroom", value: $settings.hdrEV, in: 0...3, step: 1 / 3) {
-                String(format: "%+.1f EV", $0)
+            Disclosure(shown: settings.hdr) {
+                Divider()
+                LabeledSlider("HDR headroom", value: $settings.hdrEV, in: 0...3, step: 1 / 3) {
+                    String(format: "%+.1f EV", $0)
+                }
             }
-            .disabled(!settings.hdr)
 
             Divider()
 
@@ -80,17 +127,16 @@ struct DevelopControls: View {
             Divider()
 
             SettingRow {
-                Toggle("Lens correction", isOn: $settings.lensCorrection)
+                Toggle(isOn: $settings.lensCorrection) {
+                    Text("Lens correction")
+                        .strikethrough(!isX3F || !lensCorrectionAvailable)
+                }
             }
-            .disabled(!isX3F)
+            .disabled(!isX3F || !lensCorrectionAvailable)
         }
         .font(.body)
         .foregroundStyle(SigmaTheme.ink)
         .tint(SigmaTheme.ink)
-        // One transaction animates the disclosure, the accessory fade, and the
-        // rows sliding — concurrently, so hiding never waits on a stage.
-        .animation(.snappy(duration: 0.28), value: settings.autoTone)
-        .animation(.snappy(duration: 0.28), value: autoExposureEV)
         .onAppear {
             if settings.hdr && !settings.autoTone {
                 settings.autoTone = true
@@ -173,23 +219,24 @@ private struct WhiteBalanceControl: View {
     }
 
     var body: some View {
-        let mode = mode
         let ramp = WhiteBalance.temperatureRamp
-        VStack(spacing: 12) {
-            HStack {
-                Text("White balance")
-                Spacer()
-                Text(valueLabel)
-                    .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            VStack(spacing: 12) {
+                HStack {
+                    Text("White balance")
+                    Spacer()
+                    Text(valueLabel)
+                        .foregroundStyle(.secondary)
+                }
+
+                Picker("White balance", selection: modeSelection) {
+                    ForEach(Mode.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
             }
 
-            Picker("White balance", selection: modeSelection) {
-                ForEach(Mode.allCases, id: \.self) { Text($0.label).tag($0) }
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-
-            if mode == .custom {
+            Disclosure(shown: mode == .custom) {
                 VStack(spacing: 6) {
                     Slider(value: rampPosition, in: 0...Double(ramp.count - 1), step: 1)
                     HStack {
@@ -201,12 +248,10 @@ private struct WhiteBalanceControl: View {
                     .foregroundStyle(.tertiary)
                     .monospacedDigit()
                 }
-                .transition(.opacity)
+                .padding(.top, 12)
             }
         }
         .padding(.vertical, 13)
-        .animation(.snappy(duration: 0.28), value: mode)
-        .clipped()   // outermost
     }
 
     private var valueLabel: AttributedString {
@@ -239,7 +284,7 @@ private struct AutoExposureModeControl: View {
             .pickerStyle(.segmented)
         }
         .padding(.vertical, 13)
-        .animation(.snappy(duration: 0.28), value: mode)
+        .disabledRowStyle()
     }
 
     private var caption: String {
@@ -265,12 +310,15 @@ private struct DenoiseControl: View {
     @Binding var strength: Float
     @Binding var chroma: Float
     @Binding var time: Float
+    /// Profiled for Foveon only
+    var supported = true
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 12) {
                 HStack {
                     Text("Denoise")
+                        .strikethrough(!supported)
                     Spacer()
                     Text(caption)
                         .font(.system(.body, design: .serif))
@@ -283,27 +331,27 @@ private struct DenoiseControl: View {
                 .pickerStyle(.segmented)
             }
             .padding(.vertical, 13)
+            .disabledRowStyle()
 
-            if mode != .off {
+            Disclosure(shown: mode != .off) {
                 Divider()
                 LabeledSlider("Strength", value: $strength, in: 0...2) {
                     String(format: "%.2f", $0)
                 }
             }
-            if mode == .wavelet {
+            Disclosure(shown: mode == .wavelet) {
                 Divider()
                 LabeledSlider("Chroma", value: $chroma, in: 0...4) {
                     String(format: "%.1f×", $0)
                 }
             }
-            if mode == .neural {
+            Disclosure(shown: mode == .neural) {
                 Divider()
                 LabeledSlider("JiT signal level", value: $time, in: 0.05...0.98) {
                     String(format: "t=%.2f", $0)
                 }
             }
         }
-        .animation(.snappy(duration: 0.28), value: mode)
         // Strength means different things per algorithm; re-baseline on switch.
         .onChange(of: mode) { _, new in
             if new != .off { strength = new.defaultStrength }
@@ -336,6 +384,7 @@ private struct SettingRow<Content: View>: View {
         content
             .padding(.vertical, 13)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .disabledRowStyle()
     }
 }
 
@@ -365,7 +414,11 @@ private struct LabeledSlider: View {
                 if let accessory {
                     accessory
                         .foregroundStyle(.tertiary)
-                        .transition(.opacity)
+                        // Lands only after the disclosure rows have settled, and
+                        // dips immediately when its setting is switched off.
+                        .transition(.asymmetric(
+                            insertion: .opacity.animation(.easeIn(duration: 0.15).delay(0.32)),
+                            removal: .opacity.animation(.easeOut(duration: 0.08))))
                 }
                 Text(format(value))
                     .foregroundStyle(.secondary)
@@ -380,6 +433,7 @@ private struct LabeledSlider: View {
             }
         }
         .padding(.vertical, 13)
+        .disabledRowStyle()
     }
 }
 
@@ -393,7 +447,7 @@ private struct FilmControl: View {
                 Toggle("Film simulation", isOn: $enabled)
             }
 
-            if enabled {
+            Disclosure(shown: enabled) {
                 Divider()
                 StockPicker(title: "Film", selection: $film.film, stocks: FilmSimData.films)
 
@@ -426,7 +480,7 @@ private struct FilmControl: View {
                     Toggle("Halation", isOn: $film.halation)
                 }
 
-                if film.halation {
+                Disclosure(shown: film.halation) {
                     Divider()
                     LabeledSlider("Halation glow", value: $film.halationStrength, in: 0...2) {
                         String(format: "%.2f", $0)
@@ -455,9 +509,6 @@ private struct FilmControl: View {
                 .disabled(!film.grain)
             }
         }
-        .animation(.snappy(duration: 0.28), value: enabled)
-        .animation(.snappy(duration: 0.28), value: film.negative)
-        .animation(.snappy(duration: 0.28), value: film.halation)
         .onChange(of: film.film) { _, new in
             // A stock implies its process: companion paper (or scanned positive),
             // halation character, and a fresh neutral enlarger balance.
@@ -471,7 +522,6 @@ private struct StockPicker: View {
     let title: String
     @Binding var selection: Int
     let stocks: [FilmStock]
-    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
         // stock menu will overrun
@@ -498,6 +548,6 @@ private struct StockPicker: View {
         }
         .padding(.vertical, 13)
         // disable paper for slides etc.
-        .opacity(isEnabled ? 1 : 0.4)
+        .disabledRowStyle()
     }
 }

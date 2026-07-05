@@ -18,12 +18,12 @@ public extension FilmSimSettings {
         // Halation reflects the stock's anti-halation layer: weak layers (the
         // consumer C41 stocks) show the classic red glow; strong layers and
         // remjet-backed cine stocks stay clean.
+        let fresh = FilmSimSettings()   // model defaults
         s.halation = defaults?.halation ?? false
-        s.halationStrength = defaults?.halationStrength ?? 0.35
+        s.halationStrength = defaults?.halationStrength ?? fresh.halationStrength
 
         // Stock-independent process trims return to their defaults; the new
         // film×paper pair re-derives its neutral balance via the nil defaults.
-        let fresh = FilmSimSettings()
         s.couplers = fresh.couplers
         s.couplersRadius = fresh.couplersRadius
         s.grain = fresh.grain

@@ -152,23 +152,8 @@ struct LibraryGridView: View {
     private var progressOverlay: some View {
         ZStack {
             Color.black.opacity(0.15).ignoresSafeArea()
-            VStack(spacing: 12) {
-                ProgressView()
-                Text(progressTitle).sigmaText(.subheadline).foregroundStyle(SigmaTheme.ink)
-            }
-            .padding(28)
-            .glassEffect(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            ProgressCard(verb: isExporting ? "Developing" : "Importing")
         }
-    }
-
-    private var progressTitle: String {
-        if isExportingAll {
-            guard let progress = store.exportProgress else { return "Developing" }
-            return "Developing \(progress.done) of \(progress.total)"
-        }
-        if exportingItemID != nil { return "Developing" }
-        guard let progress = store.importProgress else { return "Importing" }
-        return "Importing \(progress.done) of \(progress.total)"
     }
 
     private var errorBinding: Binding<Bool> {
@@ -204,6 +189,31 @@ struct LibraryGridView: View {
         } catch {
             errorText = error.localizedDescription
         }
+    }
+}
+
+// MARK: - Progress card
+
+/// Read per-file progress counts in their own body,each tick re-evaluates alone
+private struct ProgressCard: View {
+    @Environment(LibraryStore.self) private var store
+    let verb: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Text(title)
+                .sigmaText(.subheadline)
+                .foregroundStyle(SigmaTheme.ink)
+                .monospacedDigit()
+        }
+        .padding(28)
+        .glassEffect(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var title: String {
+        guard let progress = store.exportProgress ?? store.importProgress else { return verb }
+        return "\(verb) \(progress.done) of \(progress.total)"
     }
 }
 
@@ -244,6 +254,15 @@ private struct GalleryCell: View {
             }
         }
         .contextMenu {
+            Button { store.rotate(item, quarterTurns: 1) } label: {
+                Label("Rotate Right", systemImage: "rotate.right")
+            }
+            Button { store.rotate(item, quarterTurns: -1) } label: {
+                Label("Rotate Left", systemImage: "rotate.left")
+            }
+
+            Divider()
+
             ForEach(item.availableFormats) { format in
                 Button { onExport(item, format) } label: {
                     Label("Export \(format.label)", systemImage: "square.and.arrow.up")
@@ -255,6 +274,13 @@ private struct GalleryCell: View {
 
             Button(role: .destructive) { store.delete(item) } label: {
                 Label("Delete", systemImage: "trash")
+            }
+        } preview: {
+            if let thumb = store.thumbnails[item.id] {
+                Image(uiImage: thumb)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 320)
             }
         }
     }
@@ -273,11 +299,12 @@ private struct LandingView: View {
                 VStack(spacing: 22) {
                     SigmaMark(size: 70)
                     VStack(spacing: 6) {
-                        Text("SIGMA Develop")
+                        Text("Developer")
                             .sigmaText(.title, weight: .regular)
                             .foregroundStyle(SigmaTheme.ink)
                         Text("X3F / RAW")
-                            .sigmaLabel(size: 11, tracking: 1.2)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(SigmaTheme.secondary)
                     }
                     Button(action: onImport) {
                         SigmaActionLabel(hasItems ? "+ Import" : "Import")
@@ -301,7 +328,9 @@ private struct SigmaActionLabel: View {
 
     var body: some View {
         Text(title)
-            .sigmaLabel(size: 12, color: SigmaTheme.ink, tracking: 1.4)
+            .font(.system(size: 12, weight: .medium))
+            .textCase(.uppercase)
+            .foregroundStyle(SigmaTheme.ink)
             .padding(.vertical, 13)
             .padding(.horizontal, 30)
             .background(SigmaTheme.surface)

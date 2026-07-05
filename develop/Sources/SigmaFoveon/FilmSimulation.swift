@@ -78,6 +78,18 @@ struct FilmSimParams: Equatable {
     var seed: UInt32
 }
 
+extension FilmSimParams {
+    /// projection of film sim params to handle cache hits
+    var tablesKey: FilmSimParams {
+        var k = self
+        k.evFilm = 0; k.gammaFilm = 0; k.gammaPaper = 0
+        k.grain = 0; k.grainSize = 0; k.grainUniformity = 0
+        k.halation = 0; k.halationScale = 0; k.halationMidtones = 0
+        k.couplersDiffused = 0; k.seed = 0
+        return k
+    }
+}
+
 // MARK: - Simulation resources
 
 final class FilmSimulation: @unchecked Sendable {
@@ -93,7 +105,7 @@ final class FilmSimulation: @unchecked Sendable {
     let film: MTLTexture      // per-stock spectral data (256×3·stocks)
 
     /// Last-computed FilmTables
-    private let tablesCache = OSAllocatedUnfairLock<(params: FilmSimParams, buffer: MTLBuffer)?>(
+    private let tablesCache = OSAllocatedUnfairLock<(key: FilmSimParams, buffer: MTLBuffer)?>(
         uncheckedState: nil)
 
     /// FilmTables byte size: 5 arrays of 41 float4 + preflash + 3 matrix rows + M·1.
@@ -102,7 +114,7 @@ final class FilmSimulation: @unchecked Sendable {
     static let shared: FilmSimulation? = {
         do { return try FilmSimulation() }
         catch {
-            FileHandle.standardError.write(Data("foveon: film simulation unavailable: \(error)\n".utf8))
+            warnStderr("film simulation unavailable: \(error)")
             return nil
         }
     }()
@@ -148,7 +160,9 @@ final class FilmSimulation: @unchecked Sendable {
         // Diffuse the coupler signal (part0 + blur) only when a radius is set; otherwise the
         // develop stage forms the coupler per-pixel and this second input is ignored.
         var couplerInput = logExp
-        if diffuse, let coupler = run(stage(self.coupler, 1, tables: false, coeff: false, film: false), [logExp], params, tables, extent, scale) {
+        if diffuse {
+            // Fail the whole apply if the coupler pass fails
+            guard let coupler = run(stage(self.coupler, 1, tables: false, coeff: false, film: false), [logExp], params, tables, extent, scale) else { return image }
             couplerInput = blur(coupler, radius: s.couplersRadius * longEdge, extent: extent)
         }
         let developStage = stage(develop, 2, tables: true, coeff: false, film: true)
@@ -162,13 +176,15 @@ final class FilmSimulation: @unchecked Sendable {
     /// dispatch on our own queue. `waitUntilCompleted` (µs-scale) makes the
     /// writes visible to Core Image's queue before any tile reads them.
     private func tables(for params: FilmSimParams) -> MTLBuffer? {
-        if let hit = tablesCache.withLockUnchecked({ $0 }), hit.params == params {
+        // Cache on the exposure/grain/halation hits
+        let key = params.tablesKey
+        if let hit = tablesCache.withLockUnchecked({ $0 }), hit.key == key {
             return hit.buffer
         }
         guard let buffer = device.makeBuffer(length: Self.tablesLength, options: .storageModePrivate),
               let cb = queue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else { return nil }
-        var p = params
+        var p = key
         enc.setComputePipelineState(setup)
         enc.setTexture(coeff, index: 0)
         enc.setTexture(film, index: 1)
@@ -179,7 +195,7 @@ final class FilmSimulation: @unchecked Sendable {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
-        tablesCache.withLockUnchecked { $0 = (params, buffer) }
+        tablesCache.withLockUnchecked { $0 = (key, buffer) }
         return buffer
     }
 
@@ -210,11 +226,12 @@ final class FilmSimulation: @unchecked Sendable {
         let data = try Data(contentsOf: url)
         // header: magic(i32) version(u16) channels(u8) datatype(u8) width(i32) height(i32) = 16 bytes
         let header = 16
+        guard data.count >= header else { throw FilmSimError.missingResource("\(name).lut truncated") }
         let (w, h): (Int, Int) = data.withUnsafeBytes {
             (Int($0.loadUnaligned(fromByteOffset: 8, as: Int32.self)),
              Int($0.loadUnaligned(fromByteOffset: 12, as: Int32.self)))
         }
-        guard data.count >= header + w * h * 16 else { throw FilmSimError.missingResource("\(name).lut truncated") }
+        guard w > 0, h > 0, data.count >= header + w * h * 16 else { throw FilmSimError.missingResource("\(name).lut truncated") }
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba32Float, width: w, height: h, mipmapped: false)
@@ -323,7 +340,7 @@ let filmSimMetalLibraryURL: URL? = {
     #endif
     guard let url = Bundle.module.url(forResource: name, withExtension: "metallib", subdirectory: "Resources")
         ?? Bundle.module.url(forResource: name, withExtension: "metallib") else {
-        FileHandle.standardError.write(Data("foveon: film simulation metallib '\(name)' missing\n".utf8))
+        warnStderr("film simulation metallib '\(name)' missing")
         return nil
     }
     return url

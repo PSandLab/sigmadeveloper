@@ -36,7 +36,6 @@ final class FoveonDenoiser: @unchecked Sendable {
     private let tile: Int         // model's fixed square input (e.g. 512)
     private let overlap: Int      // feathered seam between neighbouring tiles
     private let win: [Float]      // pre-computed separable feather window
-    private let domain: Domain    // raster domain shared by all stages
     private let colorSpace: CGColorSpace
 
     /// Load one or more models (each a `.mlmodelc`, or a `.mlpackage`/`.mlmodel`
@@ -67,7 +66,6 @@ final class FoveonDenoiser: @unchecked Sendable {
         let overlap = max(16, tile / 4)
 
         self.stages = stages
-        self.domain = domain
         self.colorSpace = domain.colorSpace
         self.tile = tile
         self.overlap = overlap
@@ -107,13 +105,14 @@ final class FoveonDenoiser: @unchecked Sendable {
         let s = max(0, min(1, strength))
         guard s > 0.001 else { return linear }
         let extent = linear.extent.integral
+        // Check for an infinite extent before Int(_:), which traps on ∞/NaN.
+        guard !extent.isInfinite, extent.width >= 1, extent.height >= 1 else { return linear }
         let w = Int(extent.width), h = Int(extent.height)
-        guard w >= 1, h >= 1, !extent.isInfinite else { return linear }
         let clamped = linear.clampedToExtent()
         let step = max(1, tile - overlap)
         let conditioning = timeFeatures(time)
 
-        var acc = [Float](repeating: 0, count: w * h * 4)   // RGB = Σ weight·colour, A = Σ weight
+        var acc = Data(count: w * h * 16)   // RGBAf: RGB = Σ weight·colour, A = Σ weight
         for ty in positions(h, step: step) {
             for tx in positions(w, step: step) {
                 // CIImage is Y-up: the tile's top row sits at maxY − ty.
@@ -255,13 +254,13 @@ final class FoveonDenoiser: @unchecked Sendable {
     }
 
     /// Accumulate a denoised tile into the image buffers with feather weights.
-    private func splat(_ outBuf: [Float], tx: Int, ty: Int, w: Int, h: Int, acc: inout [Float]) {
+    private func splat(_ outBuf: [Float], tx: Int, ty: Int, w: Int, h: Int, acc: inout Data) {
         let rowsInBounds = min(tile, h - ty)
         let colsInBounds = min(tile, w - tx)
         outBuf.withUnsafeBufferPointer { src in
-            acc.withUnsafeMutableBufferPointer { accPtr in
+            acc.withUnsafeMutableBytes { rawAcc in
                 win.withUnsafeBufferPointer { winPtr in
-                    let a = accPtr.baseAddress!, s = src.baseAddress!, wn = winPtr.baseAddress!
+                    let a = rawAcc.bindMemory(to: Float.self).baseAddress!, s = src.baseAddress!, wn = winPtr.baseAddress!
                     for k in 0..<rowsInBounds {
                         let wy = wn[k]
                         let srcRow = k * tile * 4
@@ -284,10 +283,10 @@ final class FoveonDenoiser: @unchecked Sendable {
     /// Normalise the weighted sums into a CIImage tagged with the same domain in
     /// which the model was run, so Core Image converts it back to the pipeline's
     /// scene-linear working space correctly.
-    private func resolve(_ acc: inout [Float], w: Int, h: Int) -> CIImage {
+    private func resolve(_ acc: inout Data, w: Int, h: Int) -> CIImage {
         let count = w * h
-        acc.withUnsafeMutableBufferPointer { px in
-            let p = px.baseAddress!
+        acc.withUnsafeMutableBytes { raw in
+            let p = raw.bindMemory(to: Float.self).baseAddress!
             for i in 0..<count {
                 let o = i * 4
                 let inv = 1 / max(p[o + 3], 1e-6)
@@ -297,8 +296,9 @@ final class FoveonDenoiser: @unchecked Sendable {
                 p[o + 3] = 1
             }
         }
-        let data = acc.withUnsafeBytes { Data($0) }
-        return CIImage(bitmapData: data, bytesPerRow: w * 16, size: CGSize(width: w, height: h),
+        // `acc` already holds the RGBAf bytes; hand it straight to CIImage (Data
+        // is copy-on-write and is not mutated after this) rather than copying it.
+        return CIImage(bitmapData: acc, bytesPerRow: w * 16, size: CGSize(width: w, height: h),
                        format: .RGBAf, colorSpace: colorSpace)
     }
 

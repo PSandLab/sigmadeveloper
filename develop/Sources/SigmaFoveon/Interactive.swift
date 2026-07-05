@@ -25,6 +25,8 @@ public struct DecodedRaw: @unchecked Sendable {
     public let iso: Float
     /// Decoded pixels per native pixel
     public let nativeScale: Float
+    /// self explanatory
+    public var hasLensProfile: Bool { lens != nil }
 }
 
 public struct DevelopedImage: @unchecked Sendable {
@@ -38,6 +40,12 @@ public struct DevelopedImage: @unchecked Sendable {
     let monoWeights: SIMD3<Float>?
     let lens: LensCorrection?
     let nativeScale: Float
+    /// also self explanatory
+    public var hasLensProfile: Bool { lens != nil }
+    /// Long edge of the file's native pixel grid backing this develop
+    public var nativeLongEdge: Int {
+        nativeScale > 0 ? Int((Float(max(width, height)) / nativeScale).rounded()) : max(width, height)
+    }
 }
 
 /// Proxy cap for interactive decodes
@@ -48,7 +56,7 @@ extension FoveonDeveloper {
     /// Decode `.x3f` bytes to a reusable scene-linear image
     /// Rust core now delivers a bare RGBA16F bitmap & donor supplies cached scene analysis
     public func decode(x3f data: Data, proxy: Bool = false, reusing donor: DecodedRaw? = nil) throws -> DecodedRaw {
-        decodedRaw(try renderX3F(data, mode: proxy ? .rgbaProxyHalf : .rgbaLinearF16, whiteBalance: nil),
+        decodedRaw(try renderX3F(data, mode: proxy ? .rgbaProxyHalf : .rgbaLinearF16),
                    proxy: proxy, donor: donor)
     }
 
@@ -78,7 +86,7 @@ extension FoveonDeveloper {
             let (image, nativeScale) = try rawProxy(url, maxDimension: proxyMaxDimension)
             let e = image.extent.integral
             return DecodedRaw(image: image, width: Int(e.width), height: Int(e.height),
-                              isX3F: false, stats: analyzeScene(of: image),
+                              isX3F: false, stats: donor?.stats ?? analyzeScene(of: image),
                               monoWeights: nil, lens: nil, iso: 0, nativeScale: nativeScale)
         }
         let image = try loadLinear(url)
@@ -89,9 +97,17 @@ extension FoveonDeveloper {
     }
 
     public func develop(_ decoded: DecodedRaw, options: FoveonOptions = .init()) -> DevelopedImage {
+        // upfront rotation everything downstream is adially/isotropically symmetric
+        let turns = ((options.rotate % 4) + 4) % 4
+        var image = decoded.image
+        var (width, height) = (decoded.width, decoded.height)
+        if turns != 0 {
+            image = image.oriented(forExifOrientation: [1, 6, 3, 8][turns])
+            if turns % 2 == 1 { swap(&width, &height) }
+        }
         // Reuse the decode's cached analysis
-        let developed = developLinear(decoded.image, options, isX3F: decoded.isX3F, stats: decoded.stats)
-        return DevelopedImage(image: developed.image, width: decoded.width, height: decoded.height,
+        let developed = developLinear(image, options, isX3F: decoded.isX3F, stats: decoded.stats)
+        return DevelopedImage(image: developed.image, width: width, height: height,
                               autoExposureEV: developed.autoEV, wbNeutral: decoded.stats?.wbNeutral,
                               monoWeights: decoded.monoWeights, lens: decoded.lens,
                               nativeScale: decoded.nativeScale)
@@ -113,27 +129,51 @@ extension FoveonDeveloper {
     }
 
     public func previewImage(_ developed: DevelopedImage, options: FoveonOptions = .init(), maxDimension: Int? = nil) -> CGImage? {
-        // Downscale the denoised image before tone-mapping
+        previewImage(developed, options: options,
+                     region: CGRect(x: 0, y: 0, width: 1, height: 1),
+                     maxDimension: maxDimension)?.image
+    }
+
+    /// rasterize a unit rect over the displayed image, through the same graph, @ decode res
+    /// capped at max dimension on long edge w/ new high res tiled placed overlay
+    public func previewImage(_ developed: DevelopedImage, options: FoveonOptions = .init(),
+                             region: CGRect, maxDimension: Int? = nil) -> (image: CGImage, region: CGRect)? {
+        // Downscale before tone-mapping so sharpen/grain track the output scale
         var image = developed.image
         var scale = developed.nativeScale
-        if let maxDimension, developed.width > 0, developed.height > 0 {
-            let longest = max(developed.width, developed.height)
-            if longest > maxDimension {
-                let s = CGFloat(maxDimension) / CGFloat(longest)
+        if let maxDimension {
+            let longest = max(CGFloat(developed.width) * region.width,
+                              CGFloat(developed.height) * region.height)
+            // The cap is a pixel budget, not an exact size: within 25% of it the
+            // native grid beats a softening resample (X3F's 2640 renders native
+            // under the 2560 preview cap, so zoom magnifies real pixels).
+            if longest > CGFloat(maxDimension) * 5 / 4 {
+                let s = CGFloat(maxDimension) / longest
                 image = image.transformed(by: CGAffineTransform(scaleX: s, y: s))
                 scale *= Float(s)
             }
         }
+        let extent = image.extent
+        // top-left-origin unit rect == CI bottom left origins
+        let crop = CGRect(x: extent.minX + region.minX * extent.width,
+                          y: extent.minY + (1 - region.maxY) * extent.height,
+                          width: region.width * extent.width,
+                          height: region.height * extent.height)
+            .intersection(extent).integral
+        guard !crop.isEmpty, extent.width > 0, extent.height > 0 else { return nil }
+        let actual = CGRect(x: (crop.minX - extent.minX) / extent.width,
+                            y: 1 - (crop.maxY - extent.minY) / extent.height,
+                            width: crop.width / extent.width,
+                            height: crop.height / extent.height)
         let result = tone(image, options, monoWeights: developed.monoWeights,
                           wbNeutral: developed.wbNeutral, scale: scale,
                           lens: developed.lens)
-        // EDR Canvas
-        if options.hdr, let hdr = result.hdr,
-           let space = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) {
-            return context.createCGImage(hdr, from: hdr.extent.integral, format: .RGBAh, colorSpace: space)
+        if options.hdr, let hdr = result.hdr {
+            return context.createCGImage(hdr, from: crop, format: .RGBAh,
+                                         colorSpace: extendedLinearDisplayP3ColorSpace, deferred: false).map { ($0, actual) }
         }
-        let space = CGColorSpace(name: CGColorSpace.displayP3)!
-        return context.createCGImage(result.sdr, from: result.sdr.extent.integral, format: .RGBA8, colorSpace: space)
+        return context.createCGImage(result.sdr, from: crop, format: .RGBA8,
+                                     colorSpace: displayP3ColorSpace, deferred: false).map { ($0, actual) }
     }
 
     /// Encode a decoded image straight to the requested format's bytes. JPEG/HEIC
@@ -148,7 +188,7 @@ extension FoveonDeveloper {
                 throw FoveonError.badInput("\(format.rawValue) output requires the original .x3f")
             }
             let mode: RawMode = format == .dng ? .dng : .tiffLinearF16
-            return try renderX3F(x3f, mode: mode, whiteBalance: nil).data
+            return try renderX3F(x3f, mode: mode).data
         }
     }
 }

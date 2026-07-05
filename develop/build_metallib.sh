@@ -24,7 +24,9 @@ resolve_xcode() {
         echo "$DEVELOPER_DIR"; return 0
     fi
     cand="$(xcode-select -p 2>/dev/null || true)"
-    if [ -n "$cand" ] && [ -x "$cand/usr/bin/metal" ] 2>/dev/null; then echo "$cand"; return 0; fi
+    # `metal` lives in the toolchain (invoked via xcrun), never at usr/bin/metal;
+    # gate on xcodebuild like the DEVELOPER_DIR and /Applications branches do.
+    if [ -n "$cand" ] && [ -x "$cand/usr/bin/xcodebuild" ]; then echo "$cand"; return 0; fi
     for cand in /Applications/Xcode.app /Applications/Xcode-beta.app; do
         if [ -x "$cand/Contents/Developer/usr/bin/xcodebuild" ]; then
             echo "$cand/Contents/Developer"; return 0
@@ -37,11 +39,11 @@ dev="$(resolve_xcode)" || { echo "error: full Xcode required for the metal toolc
 # sdk -> output suffix
 build() {
     local sdk="$1" name="$2"
-    local air; air="$(mktemp -t lenscorr).air"
+    local tmp air; tmp="$(mktemp -t lenscorr)"; air="$tmp.air"
     echo "compiling $name CI kernel ($sdk)..." >&2
     DEVELOPER_DIR="$dev" xcrun -sdk "$sdk" metal -fcikernel -c "$src" -o "$air"
     DEVELOPER_DIR="$dev" xcrun -sdk "$sdk" metallib -cikernel "$air" -o "$out/LensCorrection_$name.ci.metallib"
-    rm -f "$air"
+    rm -f "$tmp" "$air"
 }
 
 build macosx          macos
@@ -53,11 +55,11 @@ echo "built: $out/LensCorrection_{macos,ios,iossim}.ci.metallib" >&2
 # Plain compute metallibs (no -fcikernel/-cikernel)
 build_compute() {
     local sdk="$1" name="$2" base="$3" csrc="$4"
-    local air; air="$(mktemp -t "$base").air"
+    local tmp air; tmp="$(mktemp -t "$base")"; air="$tmp.air"
     echo "compiling $base compute kernel ($sdk)..." >&2
     DEVELOPER_DIR="$dev" xcrun -sdk "$sdk" metal -c "$csrc" -o "$air"
     DEVELOPER_DIR="$dev" xcrun -sdk "$sdk" metallib "$air" -o "$out/${base}_$name.metallib"
-    rm -f "$air"
+    rm -f "$tmp" "$air"
 }
 
 for base in FilmSim Denoise; do

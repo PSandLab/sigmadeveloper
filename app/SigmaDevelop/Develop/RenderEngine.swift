@@ -9,8 +9,14 @@ struct RenderedImage: @unchecked Sendable {
     let cgImage: CGImage
     var autoExposureEV: Float = 0
     var isHDR: Bool = false
+    var lensProfileAvailable: Bool = false //x3f only
+    /// Long edge of the file's native-resolution develop; 0 when unknown.
+    var nativeLongEdge: Int = 0
     var width: Int { cgImage.width }
     var height: Int { cgImage.height }
+    /// A deep-zoom tile can only add detail when this render undersells the
+    /// native pixel grid (small tolerance absorbs scale rounding).
+    var isAtNativeSize: Bool { max(width, height) >= nativeLongEdge - 8 }
 }
 
 /// Bridges SwiftUI to FoveonDeveloper
@@ -26,8 +32,12 @@ final class RenderEngine: @unchecked Sendable {
         queue.qualityOfService = .default
         return queue
     }()
+    /// render deep zoom tiles on a separate queue, below the edit path's QoS
+    private let tileQueue = DispatchQueue(label: "global.sigma.render.tiles", qos: .utility)
     /// Newest preview request
     private let previewGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+    /// Newest zoom-tile request
+    private let tileGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
 
     private struct DecodeKey: Equatable, Sendable {
         let path: String
@@ -38,11 +48,17 @@ final class RenderEngine: @unchecked Sendable {
     private let decodeCache = OSAllocatedUnfairLock<[(key: DecodeKey, raw: DecodedRaw)]>(initialState: [])
     private static let decodeCacheCap = 3
 
-    private var developKey: DevelopKey?
-    private var developed: DevelopedImage?
+    /// (previewSlot → queue, tileSlot → tileQueue)
+    private final class DevelopSlot {
+        var key: DevelopKey?
+        var developed: DevelopedImage?
+    }
+    private let previewSlot = DevelopSlot()
+    private let tileSlot = DevelopSlot()
 
     private struct DevelopKey: Equatable {
         let decode: DecodeKey
+        let rotation: Int
         let exposure: Float
         let autoTone: Bool
         let autoExposureMode: AutoExposureMode?
@@ -89,23 +105,39 @@ final class RenderEngine: @unchecked Sendable {
     func previewUpdates(url: URL, settings: DevelopSettings, maxDimension: Int?) -> AsyncThrowingStream<RenderedImage, Error> {
         let generation = previewGeneration.withLock { g in g += 1; return g }
         return AsyncThrowingStream { continuation in
+            let options = settings.foveonOptions()
+            let proxyPreviewed = Self.isProxyPreviewed(url)
+
+            // open x3f -> paint half res proxy w/ full concurrent decode
+            // lcock serializes yields so later quick paint wont replace full render
+            let fullDelivered = OSAllocatedUnfairLock(initialState: false)
             self.queue.async {
                 guard self.isCurrentPreview(generation) else { return continuation.finish() }
-                do {
-                    let options = settings.foveonOptions()
-                    // Camera RAW edits from the rasterised proxy
-                    let proxyPreviewed = Self.isProxyPreviewed(url)
-                    if !proxyPreviewed, !self.hasCachedDecode(url: url, proxy: false),
-                       let quick = try? self.renderPreview(url: url, options: options,
-                                                           proxy: true, maxDimension: maxDimension) {
-                        continuation.yield(quick)
-                        guard self.isCurrentPreview(generation) else { return continuation.finish() }
+                if !proxyPreviewed, !self.hasCachedDecode(url: url, proxy: false),
+                   let proxyRaw = try? self.decodeCached(url: url, proxy: true) {
+                    self.thumbnailQueue.addOperation {
+                        guard self.isCurrentPreview(generation) else { return }
+                        let developed = self.developer.develop(proxyRaw, options: options)
+                        guard let quick = try? self.rasterize(developed, options: options,
+                                                              maxDimension: maxDimension) else { return }
+                        fullDelivered.withLock { delivered in
+                            if !delivered, self.isCurrentPreview(generation) {
+                                continuation.yield(quick)
+                            }
+                        }
                     }
-                    continuation.yield(try self.renderPreview(url: url, options: options,
-                                                              proxy: proxyPreviewed,
-                                                              maxDimension: maxDimension))
+                }
+                do {
+                    let final = try self.renderPreview(url: url, options: options,
+                                                       proxy: proxyPreviewed,
+                                                       maxDimension: maxDimension)
+                    fullDelivered.withLock { delivered in
+                        delivered = true
+                        if self.isCurrentPreview(generation) { continuation.yield(final) }
+                    }
                     continuation.finish()
                 } catch {
+                    fullDelivered.withLock { $0 = true }
                     continuation.finish(throwing: error)
                 }
             }
@@ -113,13 +145,48 @@ final class RenderEngine: @unchecked Sendable {
     }
 
     private func renderPreview(url: URL, options: FoveonOptions, proxy: Bool, maxDimension: Int?) throws -> RenderedImage {
-        let developed = try developCached(url: url, options: options, proxy: proxy)
+        let developed = try developCached(url: url, options: options, proxy: proxy, slot: previewSlot)
+        return try rasterize(developed, options: options, maxDimension: maxDimension)
+    }
+
+    private func rasterize(_ developed: DevelopedImage, options: FoveonOptions, maxDimension: Int?) throws -> RenderedImage {
         guard let cg = developer.previewImage(developed, options: options,
                                               maxDimension: maxDimension) else {
             throw FoveonError.render("preview render returned nil")
         }
+        return rendered(cg, developed: developed, options: options)
+    }
+
+    private func rendered(_ cg: CGImage, developed: DevelopedImage, options: FoveonOptions) -> RenderedImage {
         let isHDR = options.hdr && (cg.colorSpace.map(CGColorSpaceUsesExtendedRange) ?? false)
-        return RenderedImage(cgImage: cg, autoExposureEV: developed.autoExposureEV, isHDR: isHDR)
+        return RenderedImage(cgImage: cg, autoExposureEV: developed.autoExposureEV, isHDR: isHDR,
+                             lensProfileAvailable: developed.hasLensProfile,
+                             nativeLongEdge: developed.nativeLongEdge)
+    }
+
+    /// Full-res render of the zoomed region, returned with the unit rect
+    /// actually rendered (post pixel-grid rounding) so the overlay registers
+    /// exactly; superseded requests return nil.
+    func regionPreview(url: URL, settings: DevelopSettings, region: CGRect,
+                       maxDimension: Int) async throws -> (image: RenderedImage, region: CGRect)? {
+        let generation = tileGeneration.withLock { g in g += 1; return g }
+        return try await withCheckedThrowingContinuation { cont in
+            tileQueue.async {
+                cont.resume(with: Result {
+                    guard self.tileGeneration.withLock({ $0 == generation }) else { return nil }
+                    let options = settings.foveonOptions()
+                    let developed = try self.developCached(url: url, options: options,
+                                                           proxy: false, slot: self.tileSlot)
+                    guard self.tileGeneration.withLock({ $0 == generation }) else { return nil }
+                    guard let (cg, actual) = self.developer.previewImage(developed, options: options,
+                                                                         region: region,
+                                                                         maxDimension: maxDimension) else {
+                        throw FoveonError.render("region render returned nil")
+                    }
+                    return (self.rendered(cg, developed: developed, options: options), actual)
+                })
+            }
+        }
     }
 
     private func isCurrentPreview(_ generation: UInt64) -> Bool {
@@ -173,8 +240,11 @@ final class RenderEngine: @unchecked Sendable {
 
     /// when leaving we weant to drop graph/gpu but keep MRU
     func releaseTransient() {
+        tileQueue.async {
+            self.tileSlot.key = nil; self.tileSlot.developed = nil
+        }
         queue.async {
-            self.developKey = nil; self.developed = nil
+            self.previewSlot.key = nil; self.previewSlot.developed = nil
             self.developer.releaseTransientResources()
         }
     }
@@ -203,11 +273,13 @@ final class RenderEngine: @unchecked Sendable {
         return fresh
     }
 
-    private func developCached(url: URL, options: FoveonOptions, proxy: Bool) throws -> DevelopedImage {
+    private func developCached(url: URL, options: FoveonOptions, proxy: Bool,
+                               slot: DevelopSlot) throws -> DevelopedImage {
         let raw = try decodeCached(url: url, proxy: proxy)
         let keyMeter = options.autoTone && options.autoExposureMode == .key
         let key = DevelopKey(
             decode: DecodeKey(path: url.path, proxy: proxy),
+            rotation: options.rotate,
             exposure: options.exposure, autoTone: options.autoTone,
             autoExposureMode: options.autoTone ? options.autoExposureMode : nil,
             toneKey: keyMeter ? options.toneKey : nil,
@@ -218,10 +290,10 @@ final class RenderEngine: @unchecked Sendable {
             denoiseTime: options.denoise == .neural ? options.denoiseTime : nil,
             denoiseEnsemble: options.denoise == .neural ? options.denoiseEnsemble : nil,
             denoiseModels: options.denoise == .neural ? options.denoiseModels.map(\.path) : nil)
-        if developKey == key, let developed { return developed }
+        if slot.key == key, let developed = slot.developed { return developed }
         let fresh = developer.develop(raw, options: options)
-        developKey = key
-        developed = fresh
+        slot.key = key
+        slot.developed = fresh
         return fresh
     }
 
@@ -239,7 +311,7 @@ final class RenderEngine: @unchecked Sendable {
         case .heic, .jpeg:
             guard Self.isProxyPreviewed(url) else {
                 // X3F previews develop full-res, so the export reuses that work
-                let developed = try developCached(url: url, options: options, proxy: false)
+                let developed = try developCached(url: url, options: options, proxy: false, slot: previewSlot)
                 return try developer.encode(developer.finish(developed, options: options),
                                             as: format.outputFormat, quality: options.quality)
             }

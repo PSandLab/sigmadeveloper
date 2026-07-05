@@ -168,7 +168,12 @@ pub unsafe extern "C" fn foveon_render(
     let Some(mode) = render_mode(mode) else {
         return -3;
     };
-    unsafe { deliver(crate::render_x3f(data, mode, wb), out_bytes, out_info) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::render_x3f(data, mode, wb)
+    })) {
+        Ok(result) => unsafe { deliver(result, out_bytes, out_info) },
+        Err(_) => -5,
+    }
 }
 
 /// Parse, Huffman-decode and colour-calibrate `.x3f` bytes once, for repeated
@@ -191,9 +196,9 @@ pub unsafe extern "C" fn foveon_open(
     let Ok(wb) = (unsafe { wb_str(wb) }) else {
         return std::ptr::null_mut();
     };
-    match crate::prepare(data, wb) {
-        Ok(p) => Box::into_raw(Box::new(FoveonPrepared(p))),
-        Err(_) => std::ptr::null_mut(),
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::prepare(data, wb))) {
+        Ok(Ok(p)) => Box::into_raw(Box::new(FoveonPrepared(p))),
+        _ => std::ptr::null_mut(),
     }
 }
 
@@ -219,7 +224,10 @@ pub unsafe extern "C" fn foveon_emit(
         return -3;
     };
     let p = unsafe { &(*prepared).0 };
-    unsafe { deliver(crate::emit(p, mode), out_bytes, out_info) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::emit(p, mode))) {
+        Ok(result) => unsafe { deliver(result, out_bytes, out_info) },
+        Err(_) => -5,
+    }
 }
 
 /// Free a handle returned by [`foveon_open`] (`NULL` is a no-op).

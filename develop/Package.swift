@@ -4,6 +4,7 @@ import Foundation
 
 let pkgDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let rustLib = "\(pkgDir)/../raw/target/release"
+let rustLink: [LinkerSetting] = [.unsafeFlags(["-L\(rustLib)", "-lsd14raw"])]
 
 let package = Package(
     name: "SigmaFoveon",
@@ -29,9 +30,7 @@ let package = Package(
         .executableTarget(
             name: "foveon",
             dependencies: ["SigmaFoveon"],
-            linkerSettings: [
-                .unsafeFlags(["-L\(rustLib)", "-lsd14raw"])
-            ]
+            linkerSettings: rustLink
         ),
     ]
 )

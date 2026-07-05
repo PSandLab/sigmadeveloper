@@ -57,6 +57,8 @@ enum ExportFormat: String, CaseIterable, Codable, Identifiable, Sendable {
 
 struct DevelopSettings: Codable, Equatable, Hashable, Sendable {
     var whiteBalance: WhiteBalance = .asShot
+    /// Quarter-turns clockwise (0…3), Per-image
+    var rotation: Int = 0
     var exposure: Float = 0
     var autoTone: Bool = false
     var autoExposureMode: AutoExposureMode = .ettr
@@ -79,6 +81,7 @@ struct DevelopSettings: Codable, Equatable, Hashable, Sendable {
     /// `exportFormat`) are intentionally excluded from preview invalidation.
     struct RenderKey: Equatable, Hashable, Sendable {
         var whiteBalance: WhiteBalance
+        var rotation: Int
         var exposure: Float
         var autoTone: Bool
         var autoExposureMode: AutoExposureMode?
@@ -96,7 +99,7 @@ struct DevelopSettings: Codable, Equatable, Hashable, Sendable {
     }
 
     var renderKey: RenderKey {
-        RenderKey(whiteBalance: whiteBalance, exposure: exposure, autoTone: autoTone,
+        RenderKey(whiteBalance: whiteBalance, rotation: rotation, exposure: exposure, autoTone: autoTone,
                   autoExposureMode: autoTone ? autoExposureMode : nil,
                   monochrome: monochrome, contrast: contrast, sharpness: sharpness,
                   lensCorrection: lensCorrection,
@@ -161,6 +164,7 @@ struct DevelopSettings: Codable, Equatable, Hashable, Sendable {
     func foveonOptions() -> FoveonOptions {
         var o = FoveonOptions()
         o.wb = whiteBalance.foveonMode
+        o.rotate = rotation
         o.exposure = exposure
         o.autoTone = autoTone
         o.autoExposureMode = autoExposureMode

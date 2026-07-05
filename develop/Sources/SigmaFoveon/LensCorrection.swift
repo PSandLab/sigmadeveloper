@@ -167,7 +167,7 @@ private let lensKernel: CIKernel? = {
     do {
         return try CIKernel(functionName: "lensCorrect", fromMetalLibraryData: data)
     } catch {
-        FileHandle.standardError.write(Data("foveon: lens-correction kernel load failed: \(error)\n".utf8))
+        warnStderr("lens-correction kernel load failed: \(error)")
         return nil
     }
 }()

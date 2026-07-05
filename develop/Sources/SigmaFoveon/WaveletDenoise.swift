@@ -106,7 +106,7 @@ final class WaveletDenoise: @unchecked Sendable {
     static let shared: WaveletDenoise? = {
         do { return try WaveletDenoise() }
         catch {
-            FileHandle.standardError.write(Data("foveon: wavelet denoise unavailable: \(error)\n".utf8))
+            warnStderr("wavelet denoise unavailable: \(error)")
             return nil
         }
     }()
@@ -257,7 +257,7 @@ final class WaveletDenoiseProcessor: CIImageProcessorKernel {
                   to: dst, destinationSlice: 0, destinationLevel: 0,
                   destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
         blit.endEncoding()
-        FileHandle.standardError.write(Data("foveon: wavelet denoise tile passed through (memory pressure)\n".utf8))
+        warnStderr("wavelet denoise tile passed through (memory pressure)")
     }
 }
 
@@ -273,7 +273,7 @@ let denoiseMetalLibraryURL: URL? = {
     #endif
     guard let url = Bundle.module.url(forResource: name, withExtension: "metallib", subdirectory: "Resources")
         ?? Bundle.module.url(forResource: name, withExtension: "metallib") else {
-        FileHandle.standardError.write(Data("foveon: denoise metallib '\(name)' missing\n".utf8))
+        warnStderr("denoise metallib '\(name)' missing")
         return nil
     }
     return url

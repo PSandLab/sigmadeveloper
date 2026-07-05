@@ -14,7 +14,6 @@ struct RawRender {
     let width: Int
     let height: Int
     let orientation: Int
-    let spatialGain: Bool
     let monoWeights: SIMD3<Float>
     let lens: LensShot?
     let iso: Float
@@ -43,23 +42,21 @@ private func rawRender(_ out: FoveonBytes, _ info: FoveonInfo, code: Int32) thro
 
     return RawRender(
         data: data, width: Int(info.width), height: Int(info.height),
-        orientation: Int(info.orientation), spatialGain: info.spatial_gain != 0,
+        orientation: Int(info.orientation),
         monoWeights: SIMD3<Float>(info.mono_weights.0, info.mono_weights.1, info.mono_weights.2),
         lens: LensShot(info), iso: info.iso)
 }
 
 /// Decode `.x3f` bytes to DNG or developed-TIFF bytes via Rust core (one-shot)
-func renderX3F(_ x3f: Data, mode: RawMode, whiteBalance: String?) throws -> RawRender {
+func renderX3F(_ x3f: Data, mode: RawMode) throws -> RawRender {
     guard !x3f.isEmpty else { throw FoveonError.badInput("empty x3f data") }
 
+    // The Rust core always renders the authentic as-shot baseline (nil WB);
+    // white balance is a post-decode finishing adjustment (see FoveonOptions.wb).
     var out = FoveonBytes()
     var info = FoveonInfo()
     let code: Int32 = x3f.withUnsafeBytes { buf in
-        let base = buf.bindMemory(to: UInt8.self).baseAddress
-        let render = { (wb: UnsafePointer<CChar>?) in
-            foveon_render(base, buf.count, mode.rawValue, wb, &out, &info)
-        }
-        return whiteBalance.map { wb in wb.withCString(render) } ?? render(nil)
+        foveon_render(buf.bindMemory(to: UInt8.self).baseAddress, buf.count, mode.rawValue, nil, &out, &info)
     }
     return try rawRender(out, info, code: code)
 }
@@ -68,12 +65,10 @@ func renderX3F(_ x3f: Data, mode: RawMode, whiteBalance: String?) throws -> RawR
 final class RawDecoder {
     private let handle: OpaquePointer
 
-    init(x3f: Data, whiteBalance: String? = nil) throws {
+    init(x3f: Data) throws {
         guard !x3f.isEmpty else { throw FoveonError.badInput("empty x3f data") }
         let handle: OpaquePointer? = x3f.withUnsafeBytes { buf in
-            let base = buf.bindMemory(to: UInt8.self).baseAddress
-            let open = { (wb: UnsafePointer<CChar>?) in foveon_open(base, buf.count, wb) }
-            return whiteBalance.map { wb in wb.withCString(open) } ?? open(nil)
+            foveon_open(buf.bindMemory(to: UInt8.self).baseAddress, buf.count, nil)
         }
         guard let handle else { throw FoveonError.decode(code: -4) }
         self.handle = handle

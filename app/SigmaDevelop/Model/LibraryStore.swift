@@ -115,6 +115,13 @@ final class LibraryStore {
         }
     }
 
+    func rotate(_ item: LibraryItem, quarterTurns: Int) {
+        guard let i = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[i].settings.rotation = (((items[i].settings.rotation + quarterTurns) % 4) + 4) % 4
+        items[i].isCustomized = true
+        refreshThumbnail(item.id)
+    }
+
     func delete(_ item: LibraryItem) {
         items.removeAll { $0.id == item.id }
         itemIDs.remove(item.id)
@@ -147,7 +154,9 @@ final class LibraryStore {
         }
         return try await engine.exportBatch(jobs) { [weak self] done, total in
             Task { @MainActor in
-                guard let self, done >= (self.exportProgress?.done ?? 0) else { return }
+                // Strictly-increasing: equal re-sets would re-render the glass
+                // progress card multiple times per frame for nothing.
+                guard let self, done > (self.exportProgress?.done ?? -1) else { return }
                 self.exportProgress = (done, total)
             }
         }
@@ -198,11 +207,33 @@ final class LibraryStore {
     }
 
     private func renderThumbnailNow(_ item: LibraryItem) async {
-        let rendered = try? await engine.thumbnail(url: item.url, settings: item.settings, maxDimension: 700)
-        guard itemIDs.contains(item.id), let cg = rendered?.cgImage else { return }
-        let image = UIImage(cgImage: cg)
-        storeThumbnail(image, for: item.id)
-        Self.persistThumbnail(image, for: item.id)
+        // Re-render until the item's settings are stable, so an edit (e.g. a
+        // rotate) landing while a render is in flight is never lost.
+        var settings = items.first(where: { $0.id == item.id })?.settings ?? item.settings
+        while true {
+            // wait for a return to foreground before rendering
+            await Self.waitUntilForeground()
+            let rendered = try? await engine.thumbnail(url: item.url, settings: settings, maxDimension: 700)
+            guard itemIDs.contains(item.id) else { return }
+            if let latest = items.first(where: { $0.id == item.id })?.settings, latest != settings {
+                settings = latest
+                continue
+            }
+            if UIApplication.shared.applicationState == .background { continue }
+            guard let cg = rendered?.cgImage else { return }
+            let image = UIImage(cgImage: cg)
+            storeThumbnail(image, for: item.id)
+            Self.persistThumbnail(image, for: item.id)
+            return
+        }
+    }
+
+    @MainActor
+    private static func waitUntilForeground() async {
+        while UIApplication.shared.applicationState == .background {
+            for await _ in NotificationCenter.default.notifications(
+                named: UIApplication.didBecomeActiveNotification) { break }
+        }
     }
 
     private func storeThumbnail(_ image: UIImage, for id: UUID) {

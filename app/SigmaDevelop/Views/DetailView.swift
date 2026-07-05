@@ -4,14 +4,21 @@ import UIKit
 struct DetailView: View {
     @Environment(LibraryStore.self) private var store
     @Environment(\.verticalSizeClass) private var vSizeClass
+    @Environment(\.scenePhase) private var scenePhase
     let item: LibraryItem
 
     @State private var settings: DevelopSettings
     @State private var preview: UIImage?
     @State private var previewIsHDR = false
     @State private var autoExposureEV: Float?
+    @State private var lensProfileAvailable = true
+    /// Until a render says otherwise, assume native res — never tile blindly.
+    @State private var previewIsNativeRes = true
     @State private var isExporting = false
     @State private var isRendering = false
+    @State private var isTileRendering = false
+    @State private var zoomTile: ZoomTile?
+    @State private var tileTask: Task<Void, Never>?
     @State private var errorTitle = "Render Failed"
     @State private var errorText: String?
     @State private var shareItems: [URL] = []
@@ -67,9 +74,15 @@ struct DetailView: View {
             }
             .task(id: settings.renderKey) { await renderPreview() }
             .onChange(of: settings) { _, _ in store.updateSettings(settings, for: item) }
+            // Renders that raced backgrounding come back black (no GPU off
+            // foreground); repaint — tiles re-request off the fresh image.
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { Task { await renderPreview() } }
+            }
             .onAppear { OrientationLock.allowsRotation = true }
             .onDisappear {
                 OrientationLock.allowsRotation = false
+                tileTask?.cancel()
                 if settings != item.settings {
                     if let preview {
                         store.adoptThumbnail(from: preview, for: item.id)
@@ -86,8 +99,14 @@ struct DetailView: View {
     private var imageStage: some View {
         ZStack {
             if let preview {
-                ZoomableImage(image: preview, isHDR: previewIsHDR,
-                              insetH: SigmaTheme.stageInsetH, insetV: SigmaTheme.stageInsetV)
+                // Tiles engage only when the base preview undersells the file's
+                // native grid — resolution-driven, so it holds for RAW and X3F
+                // alike (an X3F at the native 2640 grid never tiles; anything
+                // rendered under the cap does). Film sim is excluded because
+                // grain reseeds per render and would seam against the base.
+                ZoomableImage(image: preview, isHDR: previewIsHDR, tile: zoomTile,
+                              insetH: SigmaTheme.stageInsetH, insetV: SigmaTheme.stageInsetV,
+                              onTileNeeded: settings.filmEnabled || previewIsNativeRes ? nil : handleTileRequest)
             } else if let thumb = store.thumbnails[item.id] {
                 Image(uiImage: thumb)
                     .resizable()
@@ -97,28 +116,43 @@ struct DetailView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .blur(radius: 8)
                     .opacity(0.5)
-            } else {
-                ProgressView().controlSize(.large)
             }
 
-            if isBusy {
-                ProgressView()
-                    .padding(11)
-                    .glassEffect(in: Circle())
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                    .padding(18)
-                    // Renders usually finish in a frame or two; only surface the
-                    // spinner when work persists, so quick edits never flash it.
-                    .transition(.asymmetric(
-                        insertion: .opacity.animation(.easeIn(duration: 0.12).delay(0.35)),
-                        removal: .opacity.animation(.easeOut(duration: 0.1))))
-            }
+            // classic springboard spinner :D
+            ActivitySpinner(animating: isBusy)
+                .allowsHitTesting(false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(SigmaTheme.surface)
         .clipped()
         .padding(.top, isLandscape ? 0 : SigmaTheme.contentTopInset)
-        .contextMenu { exportActions }
+        .contextMenu {
+            rotateActions
+            Divider()
+            exportActions
+        } preview: {
+            liftPreview
+        }
+    }
+
+    /// The lift platter hugs the photo — no mat, no letterboxing; landscape
+    /// bars only ever come from the stage itself when the device is rotated.
+    @ViewBuilder private var liftPreview: some View {
+        if let image = preview ?? store.thumbnails[item.id] {
+            let h = (320 * image.size.height / max(image.size.width, 1)).rounded()
+            Image(uiImage: image)
+                .resizable()
+                .frame(width: 320, height: h)
+        }
+    }
+
+    @ViewBuilder private var rotateActions: some View {
+        Button { rotate(by: 1) } label: { Label("Rotate Right", systemImage: "rotate.right") }
+        Button { rotate(by: -1) } label: { Label("Rotate Left", systemImage: "rotate.left") }
+    }
+
+    private func rotate(by turns: Int) {
+        settings.rotation = (((settings.rotation + turns) % 4) + 4) % 4
     }
 
     // MARK: - Tray
@@ -152,22 +186,11 @@ struct DetailView: View {
             .frame(width: 38, height: 5)
             .padding(.top, 8)
             .padding(.bottom, 4)
-            .contentShape(Rectangle())
-            .onTapGesture(perform: toggleTray)
-            .accessibilityLabel(trayDetent == .expanded ? "Collapse controls" : "Expand controls")
-            .accessibilityAddTraits(.isButton)
-            .accessibilityAction(.default, toggleTray)
     }
 
-    private func toggleTray() {
-        let next: TrayDetent = switch trayDetent {
-        case .hidden: .collapsed
-        case .collapsed: .expanded
-        case .expanded: .collapsed
-        }
-        setTrayDetent(next)
-    }
-
+    // Detents switch on release: live tracking would resize the stage per frame
+    // (fighting the zoom re-base) and move the header under the finger,
+    // oscillating the gesture's own translation.
     private var trayDrag: some Gesture {
         DragGesture(minimumDistance: 12)
             .onEnded { value in
@@ -192,8 +215,13 @@ struct DetailView: View {
                 // Hidden shows exactly the header
                 .padding(.bottom, trayDetent == .hidden ? bottomInset : 0)
             ScrollView {
+                // No containerRelativeFrame here: it resolves against the
+                // screen, not this padded scroll view, and pushes the panel's
+                // right edge off screen. The scroll view already proposes its
+                // own width; every row compresses (stock menus truncate).
                 DevelopControls(settings: $settings, isX3F: item.isX3F,
-                                autoExposureEV: autoExposureEV)
+                                autoExposureEV: autoExposureEV,
+                                lensCorrectionAvailable: lensProfileAvailable)
                     .padding(.horizontal, 4)
             }
             .scrollIndicators(.never)
@@ -246,7 +274,7 @@ struct DetailView: View {
         )
     }
 
-    private var isBusy: Bool { isRendering || isExporting }
+    private var isBusy: Bool { isRendering || isExporting || isTileRendering }
 
     private func trayHeight(total: CGFloat, bottomInset: CGFloat) -> CGFloat {
         let collapsed = min(max(total * 0.55, 340), 560)
@@ -266,6 +294,8 @@ struct DetailView: View {
         if !settings.hdr { previewIsHDR = false }
         let renderKey = settings.renderKey
         isRendering = true
+        // in-flight tile was rendered for the previous settings.
+        cancelTileTask()
         defer {
             if settings.renderKey == renderKey { isRendering = false }
         }
@@ -275,7 +305,11 @@ struct DetailView: View {
                 guard !Task.isCancelled else { return }
                 preview = UIImage(cgImage: rendered.cgImage)
                 previewIsHDR = rendered.isHDR
+                previewIsNativeRes = rendered.isAtNativeSize
                 autoExposureEV = rendered.autoExposureEV
+                if item.isX3F { lensProfileAvailable = rendered.lensProfileAvailable }
+                // Stale for the new pixels; the zoom view re-requests as needed
+                if zoomTile != nil { zoomTile = nil }
                 errorText = nil
             }
         } catch {
@@ -284,6 +318,40 @@ struct DetailView: View {
                 errorText = error.localizedDescription
             }
         }
+    }
+
+    /// deep zoom tile flow
+    private func handleTileRequest(_ request: ZoomTileRequest?) {
+        guard let request else {
+            cancelTileTask()
+            if zoomTile != nil { zoomTile = nil }
+            return
+        }
+        // A capped tile re-emits its own request on settle; it's already applied.
+        guard zoomTile?.request != request else { return }
+        // Never race an in-flight preview render (it may still be swapping a
+        // progressive proxy for the full develop); the fresh image re-emits
+        // the request from `updateUIView` once it lands.
+        guard !isRendering else { return }
+        tileTask?.cancel()
+        tileTask = Task {
+            isTileRendering = true
+            // A superseding task owns the flag from the moment it cancels this
+            // one; only a task that ran to completion may clear it.
+            defer { if !Task.isCancelled { isTileRendering = false } }
+            guard let (rendered, actual) = try? await store.engine.regionPreview(
+                    url: item.url, settings: settings,
+                    region: request.region, maxDimension: request.longEdge),
+                  !Task.isCancelled else { return }
+            zoomTile = ZoomTile(image: UIImage(cgImage: rendered.cgImage),
+                                region: actual, isHDR: rendered.isHDR, request: request)
+        }
+    }
+
+    private func cancelTileTask() {
+        tileTask?.cancel()
+        tileTask = nil
+        isTileRendering = false
     }
 
     private func exportAndShare(_ format: ExportFormat) async {
@@ -303,14 +371,57 @@ struct DetailView: View {
 
 // MARK: - Zoomable image
 
+/// Render the visible region sharp on tile zoom
+struct ZoomTile {
+    let id = UUID()
+    let image: UIImage
+    /// Unit rect the engine actually rendered (top-left origin) — the overlay
+    /// is placed here, exactly on the pixel grid the tile was cut from.
+    let region: CGRect
+    let isHDR: Bool
+    let request: ZoomTileRequest
+}
+
+/// Visible region and target pixel long edge for a sharpening tile.
+struct ZoomTileRequest: Equatable {
+    let region: CGRect
+    let longEdge: Int
+}
+
+/// Cspinner :D
+private struct ActivitySpinner: UIViewRepresentable {
+    var animating: Bool
+
+    func makeUIView(context: Context) -> UIActivityIndicatorView {
+        let spinner = UIActivityIndicatorView(style: .large)
+        spinner.hidesWhenStopped = true
+        spinner.color = .white
+        spinner.layer.shadowColor = UIColor.black.cgColor
+        spinner.layer.shadowOpacity = 0.4
+        spinner.layer.shadowRadius = 2
+        spinner.layer.shadowOffset = .zero
+        return spinner
+    }
+
+    func updateUIView(_ spinner: UIActivityIndicatorView, context: Context) {
+        if animating, !spinner.isAnimating {
+            spinner.startAnimating()
+        } else if !animating, spinner.isAnimating {
+            spinner.stopAnimating()
+        }
+    }
+}
+
 /// Native pinch-, pan-, and double-tap-zoomable image clipped to its containing box.
 private struct ZoomableImage: UIViewRepresentable {
     let image: UIImage
     /// Only opt into the display's extended range when the render is actually an
     /// HDR/EDR image — otherwise an ordinary SDR preview would be shown boosted.
     var isHDR: Bool = false
+    var tile: ZoomTile? = nil
     var insetH: CGFloat = 0
     var insetV: CGFloat = 0
+    var onTileNeeded: ((ZoomTileRequest?) -> Void)? = nil
 
     private let maxScale: CGFloat = 6
     private let doubleTapScale: CGFloat = 2.5
@@ -355,6 +466,7 @@ private struct ZoomableImage: UIViewRepresentable {
 
     func updateUIView(_ scrollView: ZoomScrollView, context: Context) {
         let coordinator = context.coordinator
+        let imageChanged = coordinator.imageView.image !== image
         let imageSizeChanged = coordinator.imageSize != image.size
         let boundsChanged = coordinator.boundsSize != scrollView.bounds.size
         let insetChanged = coordinator.insetH != insetH || coordinator.insetV != insetV
@@ -363,10 +475,18 @@ private struct ZoomableImage: UIViewRepresentable {
         coordinator.insetV = insetV
         coordinator.maxScale = maxScale
         coordinator.doubleTapScale = doubleTapScale
+        coordinator.onTileNeeded = onTileNeeded
         coordinator.imageView.preferredImageDynamicRange = isHDR ? .high : .standard
 
-        if coordinator.imageView.image !== image {
+        if imageChanged {
             coordinator.imageView.image = image
+        }
+        let resolvedTile = imageChanged ? nil : tile
+        if coordinator.appliedTile?.id != resolvedTile?.id {
+            coordinator.setTile(resolvedTile)
+        }
+        if imageChanged {
+            DispatchQueue.main.async { [weak coordinator] in coordinator?.maybeRequestTile() }
         }
 
         guard imageSizeChanged || boundsChanged || insetChanged else {
@@ -386,6 +506,7 @@ private struct ZoomableImage: UIViewRepresentable {
 
     final class Coordinator: NSObject, UIScrollViewDelegate {
         let imageView = UIImageView()
+        private let tileView = UIImageView()
         weak var scrollView: UIScrollView?
 
         var boundsSize: CGSize = .zero
@@ -394,12 +515,26 @@ private struct ZoomableImage: UIViewRepresentable {
         var maxScale: CGFloat = 4
         var insetH: CGFloat = 0
         var insetV: CGFloat = 0
+        var onTileNeeded: ((ZoomTileRequest?) -> Void)?
+        private(set) var appliedTile: ZoomTile?
+
+        /// zoom in overshoot corners
+        private static let zoomedCornerFraction: CGFloat = 0.22
+        /// Ask for a sharper tile
+        private static let tileTriggerDensity: CGFloat = 1.2
+        /// Extra half-viewport rendered on edge
+        private static let tilePadFraction: CGFloat = 0.5
+        private static let tileMaxLongEdge: CGFloat = 2560
 
         override init() {
             super.init()
             imageView.contentMode = .scaleAspectFit
             imageView.clipsToBounds = true
             imageView.isUserInteractionEnabled = true
+            // The tile's frame is fill region
+            tileView.contentMode = .scaleToFill
+            tileView.isHidden = true
+            imageView.addSubview(tileView)
         }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
@@ -410,37 +545,133 @@ private struct ZoomableImage: UIViewRepresentable {
             centerContent(in: scrollView)
         }
 
+        func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+            maybeRequestTile()
+        }
+
+        func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+            if !decelerate { maybeRequestTile() }
+        }
+
+        func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            maybeRequestTile()
+        }
+
         func layoutContent(in scrollView: UIScrollView, resetZoom: Bool) {
             guard let image = imageView.image, scrollView.bounds.width > 0, scrollView.bounds.height > 0 else {
                 return
             }
 
-            let zoomScale = scrollView.zoomScale
             let fittedSize = fittedSize(for: image.size, in: scrollView.bounds.size)
+            // Same base geometry (a sharper render of the same layout): skip the
+            // re-base entirely so swapping pixels never touches scroll state.
+            if !resetZoom,
+               abs(imageView.bounds.width - fittedSize.width) < 0.5,
+               abs(imageView.bounds.height - fittedSize.height) < 0.5 {
+                scrollView.maximumZoomScale = maxScale
+                centerContent(in: scrollView)
+                return
+            }
+
             // `frame` is the post-zoom-transform box: assigning it while zoomed
             // silently shrinks the base geometry (zoomScale stays high while the
             // image reads as fitted, so the next double-tap "toggles" outward).
-            // Neutralise the zoom, re-base the geometry, then restore.
-            scrollView.zoomScale = 1
-            imageView.frame = CGRect(origin: .zero, size: fittedSize)
-            scrollView.contentSize = fittedSize
-            scrollView.minimumZoomScale = 1
-            scrollView.maximumZoomScale = maxScale
-            scrollView.zoomScale = resetZoom ? 1 : min(max(zoomScale, 1), maxScale)
-
-            centerContent(in: scrollView)
+            // Neutralise the zoom, re-base the geometry, then restore
+            UIView.performWithoutAnimation {
+                let zoomScale = scrollView.zoomScale
+                scrollView.zoomScale = 1
+                imageView.frame = CGRect(origin: .zero, size: fittedSize)
+                scrollView.contentSize = fittedSize
+                scrollView.minimumZoomScale = 1
+                scrollView.maximumZoomScale = maxScale
+                scrollView.zoomScale = resetZoom ? 1 : min(max(zoomScale, 1), maxScale)
+                layoutTile()
+                centerContent(in: scrollView)
+            }
         }
 
         func centerContent(in scrollView: UIScrollView) {
+            // Breathing room grows with zoom (fully by 1.5×) so a corner can be
+            // pulled well clear of the stage edge.
+            let t = min(max((scrollView.zoomScale - 1) / 0.5, 0), 1)
+            let padH = insetH + (max(scrollView.bounds.width * Self.zoomedCornerFraction, insetH) - insetH) * t
+            let padV = insetV + (max(scrollView.bounds.height * Self.zoomedCornerFraction, insetV) - insetV) * t
             // Floor the centring insets at the stage insets for zoom
-            let floorH = min(insetH, scrollView.bounds.width / 2)
-            let floorV = min(insetV, scrollView.bounds.height / 2)
+            let floorH = min(padH, scrollView.bounds.width / 2)
+            let floorV = min(padV, scrollView.bounds.height / 2)
             let horizontalInset = max((scrollView.bounds.width - scrollView.contentSize.width) / 2, floorH)
             let verticalInset = max((scrollView.bounds.height - scrollView.contentSize.height) / 2, floorV)
             scrollView.contentInset = UIEdgeInsets(top: verticalInset,
                                                   left: horizontalInset,
                                                   bottom: verticalInset,
                                                   right: horizontalInset)
+        }
+
+        // MARK: Deep-zoom tiles
+
+        func setTile(_ tile: ZoomTile?) {
+            appliedTile = tile
+            tileView.image = tile?.image
+            tileView.preferredImageDynamicRange = (tile?.isHDR ?? false) ? .high : .standard
+            tileView.isHidden = tile == nil
+            layoutTile()
+        }
+
+        private func layoutTile() {
+            guard let region = appliedTile?.region else { return }
+            let base = imageView.bounds.size
+            tileView.frame = CGRect(x: region.minX * base.width,
+                                    y: region.minY * base.height,
+                                    width: region.width * base.width,
+                                    height: region.height * base.height)
+        }
+
+        /// Report a padded region whenever the displayed size outruns the base
+        /// preview's pixels — and rescind (nil) when it no longer does. While the
+        /// viewport stays inside the applied tile at full density, nothing is
+        /// emitted, so panning never swaps or drops a tile that still covers.
+        func maybeRequestTile() {
+            guard let scrollView, let onTileNeeded else { return }
+            guard !scrollView.isZooming, !scrollView.isDragging, !scrollView.isDecelerating else { return }
+            let fitted = imageView.bounds.size
+            let zoom = scrollView.zoomScale
+            guard zoom > 1.02, fitted.width > 0, fitted.height > 0,
+                  imageSize.width > 0, imageSize.height > 0 else {
+                return onTileNeeded(nil)
+            }
+            let visible = scrollView.convert(scrollView.bounds, to: imageView)
+                .intersection(CGRect(origin: .zero, size: fitted))
+            guard !visible.isEmpty else { return onTileNeeded(nil) }
+
+            let displayScale = max(scrollView.traitCollection.displayScale, 1)
+            // Screen pixels the region paints vs base-preview pixels backing it.
+            let displayedPx = max(visible.width, visible.height) * zoom * displayScale
+            let sourcePx = max(visible.width / fitted.width * imageSize.width,
+                               visible.height / fitted.height * imageSize.height)
+            guard displayedPx > sourcePx * Self.tileTriggerDensity else { return onTileNeeded(nil) }
+
+            let visibleUnit = CGRect(x: visible.minX / fitted.width,
+                                     y: visible.minY / fitted.height,
+                                     width: visible.width / fitted.width,
+                                     height: visible.height / fitted.height)
+            if let tile = appliedTile,
+               tile.region.insetBy(dx: -0.001, dy: -0.001).contains(visibleUnit) {
+                let tilePx = max(tile.image.size.width, tile.image.size.height) * tile.image.scale
+                let tileScreenPx = max(tile.region.width * fitted.width,
+                                       tile.region.height * fitted.height) * zoom * displayScale
+                if tilePx >= tileScreenPx * 0.95 { return }
+            }
+
+            let padded = visible.insetBy(dx: -visible.width * Self.tilePadFraction,
+                                         dy: -visible.height * Self.tilePadFraction)
+                .intersection(CGRect(origin: .zero, size: fitted))
+            let paddedPx = max(padded.width, padded.height) * zoom * displayScale
+            let region = CGRect(x: padded.minX / fitted.width,
+                                y: padded.minY / fitted.height,
+                                width: padded.width / fitted.width,
+                                height: padded.height / fitted.height)
+            onTileNeeded(ZoomTileRequest(region: region,
+                                         longEdge: Int(min(paddedPx.rounded(.up), Self.tileMaxLongEdge))))
         }
 
         @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {

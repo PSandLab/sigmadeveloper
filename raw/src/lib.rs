@@ -377,15 +377,14 @@ impl Tree {
 const FAST_BITS: u32 = 12;
 struct Huffman {
     tree: Tree,
-    len: Vec<u8>,  // code length for each FAST_BITS prefix (0 = escape to tree)
-    val: Vec<u16>, // decoded value for each FAST_BITS prefix
+    len: Box<[u8; 1 << FAST_BITS]>,  // code length for each FAST_BITS prefix
+    val: Box<[u16; 1 << FAST_BITS]>, // decoded value for each FAST_BITS prefix
 }
 impl Huffman {
     fn new(table: &[u32], mapping: &[u16]) -> Self {
         let tree = build_tree(table, mapping);
-        let size = 1usize << FAST_BITS;
-        let mut len = vec![0u8; size];
-        let mut val = vec![0u16; size];
+        let mut len = Box::new([0u8; 1 << FAST_BITS]);
+        let mut val = Box::new([0u16; 1 << FAST_BITS]);
         let use_map = table.len() == mapping.len();
         for (i, &element) in table.iter().enumerate() {
             let length = (element >> 27) & 0x1f;
@@ -393,6 +392,11 @@ impl Huffman {
                 continue;
             }
             let code = element & 0x07ff_ffff;
+            // Reject a code wider than its declared length: otherwise `base`
+            // indexes past the 2^FAST_BITS fast table
+            if code >= (1u32 << length) {
+                continue;
+            }
             let value = if use_map { mapping[i] } else { i as u16 };
 
             let base = (code << (FAST_BITS - length)) as usize;
@@ -627,19 +631,22 @@ fn decode_simple(
             mapping[idx as usize] as i32
         }
     };
-    for row in 0..rows {
+    // mild parallel 
+    let row_len = cols * 3;
+    let base_ptr = SyncPtr(out.as_mut_ptr());
+    parallel_rows(rows, ROW_CHUNK, |row| {
+        let out_row = unsafe { std::slice::from_raw_parts_mut(base_ptr.add(row * row_len), row_len) };
         let base = row * row_stride;
         let mut c = [0u16; 3];
-        for col in 0..cols {
+        for (col, px) in out_row.chunks_exact_mut(3).enumerate() {
             let val = u32at(body, base + col * 4).unwrap_or(0);
-            for color in 0..3 {
+            for (color, o) in px.iter_mut().enumerate() {
                 let idx = ((val >> (color as u32 * bits)) & mask) as u16;
                 c[color] = (c[color] as i32).wrapping_add(get(idx)) as u16;
-                let v = if (c[color] as i16) > 0 { c[color] } else { 0 };
-                out[3 * (row * cols + col) + color] = v;
+                *o = if (c[color] as i16) > 0 { c[color] } else { 0 };
             }
         }
-    }
+    });
 }
 
 // CAMF (camera metadata): type-2 decrypt + entry table
@@ -745,7 +752,7 @@ impl Camf {
             .map(|(_, v)| v.as_str())
     }
     /// Resolve a per-white-balance matrix (`list[wb]` → matrix name → matrix).
-    fn matrix_for_wb(&self, list: &str, wb: &str, dim0: usize, dim1: usize) -> Option<Vec<f64>> {
+    fn matrix_for_wb(&self, list: &str, wb: &str, dim0: usize, dim1: usize) -> Option<&[f64]> {
         let mat_name = self.property_get(list, wb).or_else(|| {
             if wb == "Daylight" {
                 self.property_get(list, "Sunlight") // SD1 workaround
@@ -756,7 +763,7 @@ impl Camf {
         let m = self.matrix(mat_name)?;
         let want = dim0.max(1) * dim1.max(1);
         match &m.data {
-            Mat::F64(v) if v.len() == want => Some(v.clone()),
+            Mat::F64(v) if v.len() == want => Some(v.as_slice()),
             _ => None,
         }
     }
@@ -1055,6 +1062,9 @@ fn transform_rect(camf: &Camf, cols: usize, rows: usize, rect: [u32; 4]) -> Opti
         return None;
     }
     let (kx0, ky0, kx1, ky1) = (keep[0], keep[1], keep[2], keep[3]);
+    if kx1 < kx0 || ky1 < ky0 {
+        return None; // malformed KeepImageArea
+    }
     let keep_cols = (kx1 - kx0 + 1) as usize;
     let keep_rows = (ky1 - ky0 + 1) as usize;
     let mut x0 = rect[0].max(kx0);
@@ -1135,7 +1145,7 @@ fn active_area(camf: &Camf, raw: &Raw) -> Option<[u32; 4]> {
 
 /// Resolve the white-balance name to use, honouring the as-shot tag, a CLI
 /// override, and falling back to any key the camera actually provides.
-fn resolve_wb(camf: &Camf, header: &Header, override_wb: &Option<String>) -> String {
+fn resolve_wb(camf: &Camf, header: &Header, override_wb: Option<&str>) -> String {
     // A WB is usable if any of the gain (TRUE-engine) or illuminant/correction
     // (pre-TRUE) property lists carry an entry for it.
     let has = |w: &str| {
@@ -1151,7 +1161,7 @@ fn resolve_wb(camf: &Camf, header: &Header, override_wb: &Option<String>) -> Str
     if let Some(w) = override_wb
         && has(w)
     {
-        return w.clone();
+        return w.to_string();
     }
     let asshot = header.white_balance.trim();
     if !asshot.is_empty() && has(asshot) {
@@ -1271,6 +1281,17 @@ fn normalise(raw: &Raw, cal: &Calibration) -> Vec<u16> {
     ];
     let mut out = vec![0u16; raw.data.len()];
     let row_len = raw.columns * 3;
+    // The per-channel remap is a pure function of the 16-bit sample, so bake it
+    // into a LUT once (same f64 expression → bit-identical output) and reduce
+    // each sample to a single table load
+    let lut: [Vec<u16>; 3] = std::array::from_fn(|c| {
+        (0..=u16::MAX)
+            .map(|s| {
+                let n = (s as f64 - cal.black[c]) * scale[c];
+                (n.clamp(0.0, 1.0) * 65535.0).round() as u16
+            })
+            .collect()
+    });
     let base = SyncPtr(out.as_mut_ptr());
     parallel_rows(raw.rows, ROW_CHUNK, |row| {
         let src = &raw.data[row * row_len..][..row_len];
@@ -1279,8 +1300,7 @@ fn normalise(raw: &Raw, cal: &Calibration) -> Vec<u16> {
         let dst = unsafe { std::slice::from_raw_parts_mut(base.add(row * row_len), row_len) };
         for (s, d) in src.chunks_exact(3).zip(dst.chunks_exact_mut(3)) {
             for c in 0..3 {
-                let n = (s[c] as f64 - cal.black[c]) * scale[c];
-                d[c] = (n.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                d[c] = lut[c][s[c] as usize];
             }
         }
     });
@@ -1454,6 +1474,11 @@ const REC709_LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 /// a Foveon highlight where one stacked layer saturates before the others
 /// renders magenta, so we fade such pixels toward neutral etc
 const CLIP_KNEE: f32 = 0.88;
+/// Reciprocal of the highlight-reconstruction knee span. The per-pixel path
+/// multiplies by this instead of dividing (an FDIV is ~10× the latency of an
+/// FMUL); it is a compile-time constant, so `x * CLIP_SPAN_INV` is the identical
+/// operation in the scalar and NEON paths — they stay bit-for-bit matched.
+const CLIP_SPAN_INV: f32 = 1.0 / (1.0 - CLIP_KNEE);
 
 /// Develop one pixel of decoded raw BMT into a scene-linear sRGB half-float triple
 fn develop_pixel(
@@ -1479,12 +1504,12 @@ fn develop_pixel(
     };
     // Colour matrix (XYZ→sRGB · BMT→XYZ · diag(gain)); keep linear headroom
     let mut rgb = [
-        m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
-        m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
-        m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
+        m[2].mul_add(v[2], m[1].mul_add(v[1], m[0] * v[0])),
+        m[5].mul_add(v[2], m[4].mul_add(v[1], m[3] * v[0])),
+        m[8].mul_add(v[2], m[7].mul_add(v[1], m[6] * v[0])),
     ];
     // Highlight reconstruction
-    let t = ((sat - CLIP_KNEE) / (1.0 - CLIP_KNEE)).clamp(0.0, 1.0);
+    let t = ((sat - CLIP_KNEE) * CLIP_SPAN_INV).clamp(0.0, 1.0);
     if t > 0.0 {
         let mx = rgb[0].max(rgb[1]).max(rgb[2]);
         for v in &mut rgb {
@@ -1595,7 +1620,7 @@ fn develop_linear_srgb(
                 let zero = vdupq_n_f32(0.0);
                 let one = vdupq_n_f32(1.0);
                 let knee = vdupq_n_f32(CLIP_KNEE);
-                let span = vdupq_n_f32(1.0 - CLIP_KNEE);
+                let inv_span = vdupq_n_f32(CLIP_SPAN_INV);
                 let alpha = vdup_n_u16(HALF_ONE);
                 let quads = w / 4;
                 for q in 0..quads {
@@ -1625,21 +1650,14 @@ fn develop_linear_srgb(
                             vmaxq_f32(nt, zero),
                         )
                     };
-                    // Colour matrix, left-to-right accumulation to match the scalar.
-                    let mut rr = vaddq_f32(
-                        vaddq_f32(vmulq_f32(mm[0], vb), vmulq_f32(mm[1], vm)),
-                        vmulq_f32(mm[2], vt),
-                    );
-                    let mut rg = vaddq_f32(
-                        vaddq_f32(vmulq_f32(mm[3], vb), vmulq_f32(mm[4], vm)),
-                        vmulq_f32(mm[5], vt),
-                    );
-                    let mut rb = vaddq_f32(
-                        vaddq_f32(vmulq_f32(mm[6], vb), vmulq_f32(mm[7], vm)),
-                        vmulq_f32(mm[8], vt),
-                    );
+                    // Colour matrix via FMA, same accumulation order as the scalar
+                    // path (m0·v0 first, then fused +m1·v1, +m2·v2) so the two stay
+                    // bit-matched: fewer ops and one less rounding step per channel.
+                    let mut rr = vfmaq_f32(vfmaq_f32(vmulq_f32(mm[0], vb), mm[1], vm), mm[2], vt);
+                    let mut rg = vfmaq_f32(vfmaq_f32(vmulq_f32(mm[3], vb), mm[4], vm), mm[5], vt);
+                    let mut rb = vfmaq_f32(vfmaq_f32(vmulq_f32(mm[6], vb), mm[7], vm), mm[8], vt);
                     // Highlight reconstruction toward the neutral max
-                    let t = vmaxq_f32(vminq_f32(vdivq_f32(vsubq_f32(sat, knee), span), one), zero);
+                    let t = vmaxq_f32(vminq_f32(vmulq_f32(vsubq_f32(sat, knee), inv_span), one), zero);
                     let mx = vmaxq_f32(vmaxq_f32(rr, rg), rb);
                     rr = vaddq_f32(rr, vmulq_f32(t, vsubq_f32(mx, rr)));
                     rg = vaddq_f32(rg, vmulq_f32(t, vsubq_f32(mx, rg)));
@@ -1931,8 +1949,8 @@ fn serialize_ifd(fields: &mut [Field], heap_off: u32, heap: &mut Vec<u8>, next: 
         out.extend_from_slice(&f.typ.to_le_bytes());
         out.extend_from_slice(&f.count.to_le_bytes());
         if f.data.len() <= 4 {
-            let mut v = f.data.clone();
-            v.resize(4, 0);
+            let mut v = [0u8; 4];
+            v[..f.data.len()].copy_from_slice(&f.data);
             out.extend_from_slice(&v);
         } else {
             let at = heap_off + heap.len() as u32;
@@ -2217,7 +2235,7 @@ fn prepare(x3f: &[u8], override_wb: Option<&str>) -> R<Prepared> {
 
     let raw = decode_raw(raw_sect)?;
     let camf = Camf::parse(camf_sect)?;
-    let wb = resolve_wb(&camf, &container.header, &override_wb.map(str::to_string));
+    let wb = resolve_wb(&camf, &container.header, override_wb);
     let cal = build_calibration(&camf, &raw, &wb)?;
     let area = active_area(&camf, &raw);
     let sgain = classic_spatial_gain(&camf, &wb);

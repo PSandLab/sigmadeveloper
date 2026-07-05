@@ -4,6 +4,17 @@ import CoreImage.CIFilterBuiltins
 import Foundation
 
 let extendedLinearSRGB = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
+let sRGBColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+let displayP3ColorSpace = CGColorSpace(name: CGColorSpace.displayP3)!
+let extendedLinearDisplayP3ColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
+
+/// Rec.709 luma weights; share this between scene analysis & metering
+let rec709Luma = SIMD3<Float>(0.2126, 0.7152, 0.0722)
+
+/// Emit a `foveon: …` diagnostic line to standard error.
+func warnStderr(_ message: String) {
+    FileHandle.standardError.write(Data("foveon: \(message)\n".utf8))
+}
 
 /// Sharpen radius at full resolution. A downscaled preview scales it by its reduction
 /// factor so the on-screen sharpening matches what the full-res export will produce.
@@ -70,7 +81,7 @@ private let gainExtendKernel: CIColorKernel? = {
     do {
         return try CIKernel(functionName: "gainExtend", fromMetalLibraryData: data) as? CIColorKernel
     } catch {
-        FileHandle.standardError.write(Data("foveon: gainExtend kernel load failed: \(error)\n".utf8))
+        warnStderr("gainExtend kernel load failed: \(error)")
         return nil
     }
 }()
@@ -81,9 +92,12 @@ extension FoveonDeveloper {
     /// Develop a scene-linear image, when requested, an HDR sibling for the ISO gain map.
     func render(_ linear: CIImage, _ o: FoveonOptions, isX3F: Bool, monoWeights: SIMD3<Float>? = nil,
                 lens: LensCorrection? = nil) -> (sdr: CIImage, hdr: CIImage?) {
+        // Honour requested quarter-turns
+        let turns = ((o.rotate % 4) + 4) % 4
+        let image = turns == 0 ? linear : linear.oriented(forExifOrientation: [1, 6, 3, 8][turns])
         // 1 proxy analysis feeds both auto-exposure and auto-WB.
-        let stats = (o.autoTone || o.wb == .auto) ? analyzeScene(of: linear) : nil
-        let developed = developLinear(linear, o, isX3F: isX3F, stats: stats)
+        let stats = (o.autoTone || o.wb == .auto) ? analyzeScene(of: image) : nil
+        let developed = developLinear(image, o, isX3F: isX3F, stats: stats)
         return tone(developed.image, o, monoWeights: monoWeights, wbNeutral: stats?.wbNeutral, lens: lens)
     }
 
@@ -142,7 +156,7 @@ extension FoveonDeveloper {
 
     /// one gpu op
     private func monochrome(_ image: CIImage, weights: SIMD3<Float>?) -> CIImage {
-        let w = weights ?? SIMD3<Float>(0.2126, 0.7152, 0.0722)
+        let w = weights ?? rec709Luma
         let luma = CIVector(x: CGFloat(w.x), y: CGFloat(w.y), z: CGFloat(w.z), w: 0)
         return image.applyingFilter("CIColorMatrix", parameters: [
             "inputRVector": luma,
@@ -210,7 +224,7 @@ extension FoveonDeveloper {
 
     /// HDR
     private func hdrExtend(sdr: CIImage, _ o: FoveonOptions, extent: CGRect) -> CIImage? {
-        let stops = max(o.hdrEV, 0)
+        let stops = o.hdrEV
         guard stops > 0, let kernel = gainExtendKernel else { return nil }
         let hdr = kernel.apply(extent: extent, arguments: [sdr, stops, hdrGainRamp.lo, hdrGainRamp.hi])
         return hdr?.cropped(to: extent).settingContentHeadroom(exp2(stops))
@@ -246,11 +260,13 @@ extension FoveonDeveloper {
         let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
 
         let count = w * h
-        var buf = [Float](repeating: 0, count: count * 4)
-        buf.withUnsafeMutableBytes { raw in
+        // context.render fills the entire (0,0,w,h) region, so the readback
+        // buffer needs no zero-fill before it; skip the full-frame memset
+        let buf = [Float](unsafeUninitializedCapacity: count * 4) { raw, initialized in
             context.render(small, toBitmap: raw.baseAddress!, rowBytes: w * 16,
                            bounds: CGRect(x: 0, y: 0, width: w, height: h),
                            format: .RGBAf, colorSpace: extendedLinearSRGB)
+            initialized = count * 4
         }
 
         var hist = [UInt32](repeating: 0, count: sceneHistBins)
@@ -262,7 +278,7 @@ extension FoveonDeveloper {
             let s = p.baseAddress!
             for i in 0..<count {
                 let r = s[i * 4], g = s[i * 4 + 1], b = s[i * 4 + 2]
-                let y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                let y = rec709Luma.x * r + rec709Luma.y * g + rec709Luma.z * b
                 logSum += log(max(y, 1e-4))
 
                 let mx = max(r, max(g, b)), mn = min(r, min(g, b))
