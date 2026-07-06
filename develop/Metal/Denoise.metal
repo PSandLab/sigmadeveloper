@@ -66,8 +66,8 @@ kernel void denoiseAtrous(
     constant DenoiseParams& p [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
+    // dispatchThreads grid == texture size; w/h only bound the à-trous taps.
     const uint w = cur.get_width(), h = cur.get_height();
-    if (gid.x >= w || gid.y >= h) return;
 
     float4 c0 = cur.read(gid);
     // A single non-finite input texel would otherwise spread through every
@@ -142,7 +142,6 @@ kernel void denoiseAssemble(
     constant int2& pad [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
     const uint2 src = gid + uint2(pad);
     const float4 c = original.read(src);
     // Sanitize the source here too: `removed` is finite by construction, but an

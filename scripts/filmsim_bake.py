@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """Bake spectral film-simulation data into SigmaFoveon resources.
 
-The GPU film simulation (develop/Metal/FilmSim.metal) is a faithful port of vkdt's
-`filmsim` module, itself a port of agx-emulsion. It needs two data tables laid out
-exactly as vkdt expects, so the kernel maths stays a 1:1 translation:
-
 * ``FilmSim.lut``          per-stock film/paper spectral data, byte-compatible with
                            vkdt's ``filmsim.lut``: header ``<iHBBii`` = (1234, 2, 4,
                            1, 256, 3*stocks) then, per stock, three 256-wide RGBA32F
@@ -15,19 +11,19 @@ exactly as vkdt expects, so the kernel maths stays a 1:1 translation:
 * ``SpectraEmission.lut``  Hanatos sigmoid spectral-upsampling coefficients (a,b,c,norm)
                            indexed by tri2quad(xy), copied from the spektrafilm LUT.
 
-It also emits ``FilmStocks.generated.swift``: the ordered film/paper tables and the
-precomputed neutral enlarger balance (CMY filters + print EV) per film×paper pair,
-lifted verbatim from vkdt's optimiser output (``wb.h``). The stock set and order match
-that optimiser exactly, so the balance is correct by construction.
+Film sensitivities are multiplied @ bake by each stock's UV/IR adaptation window;
+self-normalised so the response to the stock's reference illuminant is left unchanged
 
+emits FilmStocks.generated.swift
 Usage:  python scripts/filmsim_bake.py [--verify]
-Pure stdlib + NumPy. Re-run when the stock set or upstream data changes; commit outputs.
+NumPy required; SciPy required for the neutral-balance solve. Re-run when the stock
+set or upstream data changes; commit outputs.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
+import math
 import struct
 import sys
 from pathlib import Path
@@ -60,10 +56,9 @@ LOG_EXPOSURE = np.linspace(-4.0, 4.0, ROW_W)         # characteristic-curve doma
 HEADER = struct.Struct("<iHBBii")
 
 REPO = Path(__file__).resolve().parents[1]
-PROFILES = REPO / "resources/spektrafilm/src/spektrafilm/data/profiles"
-SPECTRA_LUT = (REPO / "resources/spektrafilm/src/spektrafilm/data/luts"
+PROFILES = REPO / "resources/spektrafilm-ofx/Resources/data/profiles"
+SPECTRA_LUT = (REPO / "resources/spektrafilm-ofx/Resources/data/luts"
                / "spectral_upsampling/hanatos_irradiance_xy_coeffs_250304.lut")
-WB_H = REPO / "resources/vkdt/src/pipe/modules/filmsim/wb.h"
 OUT = REPO / "develop/Sources/SigmaFoveon/Resources"
 GEN_SWIFT = REPO / "develop/Sources/SigmaFoveon/FilmStocks.generated.swift"
 
@@ -92,18 +87,105 @@ def _load(name):
     return json.loads((PROFILES / f"{name}.json").read_text())
 
 
-def _stock_rows(prof):
+# --------------------------------------------------- UV/IR adaptation window
+# CIE daylight components S0/S1/S2 (CIE 15, 380..780nm @10nm) for the D-series
+# reference illuminants, plus Planck for the tungsten ones. Only the *shape* matters:
+# the window normalisation below is a ratio, so constant scales cancel.
+
+_CIE_S = np.array([
+    # S0      S1     S2
+    [63.4,   38.5,   3.0], [65.8,   35.0,   1.2], [94.8,   43.4,  -1.1],
+    [104.8,  46.3,  -0.5], [105.9,  43.9,  -0.7], [96.8,   37.1,  -1.2],
+    [113.9,  36.7,  -2.6], [125.6,  35.9,  -2.9], [125.5,  32.6,  -2.8],
+    [121.3,  27.9,  -2.6], [121.3,  24.3,  -2.6], [113.5,  20.1,  -1.8],
+    [113.1,  16.2,  -1.5], [110.8,  13.2,  -1.3], [106.5,   8.6,  -1.2],
+    [108.8,   6.1,  -1.0], [105.3,   4.2,  -0.5], [104.4,   1.9,  -0.3],
+    [100.0,   0.0,   0.0], [96.0,   -1.6,   0.2], [95.1,   -3.5,   0.5],
+    [89.1,   -3.5,   2.1], [90.5,   -5.8,   3.2], [90.3,   -7.2,   4.1],
+    [88.4,   -8.6,   4.7], [84.0,   -9.5,   5.1], [85.1,  -10.9,   6.7],
+    [81.9,  -10.7,   7.3], [82.6,  -12.0,   8.6], [84.9,  -14.0,   9.8],
+    [81.3,  -13.6,  10.2], [71.9,  -12.0,   8.3], [74.3,  -13.3,   9.6],
+    [76.4,  -12.9,   8.5], [63.3,  -10.6,   7.0], [71.7,  -11.6,   7.6],
+    [77.0,  -12.2,   8.0], [65.2,  -10.2,   6.7], [47.7,   -7.8,   5.2],
+    [68.6,  -11.2,   7.4], [65.0,  -10.4,   6.8]])
+
+
+def _daylight(wl, x_d, y_d):
+    """CIE daylight-series SPD at chromaticity (x_d, y_d), interpolated onto `wl`."""
+    m = 0.0241 + 0.2562 * x_d - 0.7341 * y_d
+    m1 = (-1.3515 - 1.7703 * x_d + 5.9114 * y_d) / m
+    m2 = (0.0300 - 31.4424 * x_d + 30.0717 * y_d) / m
+    s = _CIE_S[:, 0] + m1 * _CIE_S[:, 1] + m2 * _CIE_S[:, 2]
+    return np.interp(wl, np.arange(380.0, 780.1, 10.0), s)
+
+
+def _planck(wl, temperature):
+    """Blackbody spectral radiance shape on `wl` (nm); unnormalised."""
+    h, c, k = 6.62607015e-34, 299792458.0, 1.380649e-23
+    lam = wl * 1e-9
+    return lam ** -5.0 / np.expm1(h * c / (lam * k * temperature))
+
+
+def _reference_illuminant(label, wl):
+    """The stock's balance illuminant (profile `info.reference_illuminant`).
+
+    D55 for daylight stocks; "T" (studio tungsten, 3200K Planckian) for the
+    tungsten-balanced cine stocks. Papers never take this path."""
+    if label == "T":
+        return _planck(wl, 3200.0)
+    if label == "D55":
+        return _daylight(wl, 0.33242, 0.34743)
+    raise SystemExit(f"unhandled reference illuminant {label!r} for a film stock")
+
+
+_erf = np.vectorize(math.erf)
+
+
+def _adaptation_window(wl, params):
+    """erf band-pass from `hanatos2025_adaptation_window_params` = [cUV, σUV, cIR, σIR]."""
+    c_uv, s_uv, c_ir, s_ir = (float(v) for v in params)
+    if s_uv <= 0.0 or s_ir <= 0.0:
+        return np.ones_like(wl)
+    sqrt2 = math.sqrt(2.0)
+    edge_uv = 0.5 + 0.5 * _erf((wl - c_uv) / (s_uv * sqrt2))
+    edge_ir = 0.5 - 0.5 * _erf((wl - c_ir) / (s_ir * sqrt2))
+    return np.maximum(edge_uv * edge_ir, 1e-12)
+
+
+def _windowed_log_sensitivity(data, info):
+    """log10 sensitivity (81,3 object array) with the stock's UV/IR window folded in.
+
+    Self-normalised per channel so the integrated response under the stock's
+    reference illuminant matches the unwindowed sensitivity — the window shapes
+    the band edges without shifting exposure or neutral balance conventions."""
+    sens = np.array([[np.nan if v is None else float(v) for v in row]
+                     for row in data["log_sensitivity"]])           # (81, 3)
+    window = _adaptation_window(WAVELENGTHS, data["hanatos2025_adaptation_window_params"])
+    ill = _reference_illuminant(info["reference_illuminant"], WAVELENGTHS)
+    lin = np.where(np.isnan(sens), 0.0, 10.0 ** np.where(np.isnan(sens), 0.0, sens))
+    ref = (lin * ill[:, None]).sum(0)
+    norm = (lin * (ill * window)[:, None]).sum(0) / np.maximum(ref, 1e-20)
+    shifted = sens + np.log10(window)[:, None] - np.log10(np.maximum(norm, 1e-12))[None, :]
+    return np.asarray(shifted, object)                              # NaN sentinels intact
+
+
+def _stock_rows(prof, window=False):
     """Three RGBA32F rows (sensitivity, dye density, characteristic curve) for one stock.
 
-    Mirrors resources/vkdt/.../filmsim/mklut-profiles.py so the LUT is interchangeable
-    with vkdt's and the kernel's sampling maths is identical."""
+    Mirrors resources/vkdt/.../filmsim/mklut-profiles.py so the LUT layout is
+    interchangeable with vkdt's and the kernel's sampling maths is identical.
+    With `window=True` (film stocks) the sensitivity row carries the stock's
+    normalised UV/IR adaptation window; see `_windowed_log_sensitivity`."""
     data = prof["data"]
     wl = np.asarray(data["wavelengths"], float)
     if wl.shape != WAVELENGTHS.shape or not np.allclose(wl, WAVELENGTHS):
         raise SystemExit(f"unexpected wavelength grid {wl[0]}..{wl[-1]} ({wl.size})")
 
     n = wl.size
-    sens = np.asarray(data["log_sensitivity"], object)          # (81,3) log10, may hold None
+    if window:
+        sens = _windowed_log_sensitivity(data, prof["info"])    # (81,3) log10, NaN sentinels
+    else:
+        sens = np.asarray(data["log_sensitivity"], object)      # (81,3) log10, may hold None
     chan = np.asarray(data["channel_density"], object)          # (81,3) CMY dye density
     base = data["base_density"]                                 # (81,) film base density
     curve = np.asarray(data["density_curves"], float)           # (256,3) over log_exposure
@@ -118,7 +200,9 @@ def _stock_rows(prof):
 
 
 def bake_film_lut(stocks):
-    rows = np.concatenate([_stock_rows(_load(s)) for s in stocks])   # (3*stocks, 256, 4)
+    films = set(FILMS)
+    rows = np.concatenate([_stock_rows(_load(s), window=s in films)
+                           for s in stocks])                         # (3*stocks, 256, 4)
     payload = HEADER.pack(LUT_MAGIC, 2, 4, 1, ROW_W, rows.shape[0]) + rows.astype("<f4").tobytes()
     out = OUT / "FilmSim.lut"
     out.write_bytes(payload)
@@ -146,24 +230,6 @@ def bake_spectra_lut():
     return w, h, coeff
 
 
-def parse_wb():
-    """Extract vkdt's `const float wb[F][P][4]` neutral-balance table from wb.h."""
-    text = WB_H.read_text()
-    # Match the real C declaration (numeric dimensions), not the `[$n_films]` echo
-    # inside the commented shell generator at the top of the header.
-    m = re.search(r"const\s+float\s+wb\s*\[\d+\]\[\d+\]\[\d+\]\s*=\s*\{", text)
-    if m is None:
-        raise SystemExit("wb.h: could not locate the wb[][][] table")
-    body = text[m.end():]                                       # start just after the opening brace
-    body = re.sub(r"//[^\n]*", "", body)                        # strip comments (they hold indices)
-    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", body)
-    need = len(FILMS) * len(PAPERS) * 4
-    vals = np.array(nums[:need], dtype=np.float64)
-    if vals.size != need:
-        raise SystemExit(f"wb.h parse produced {vals.size} floats, expected {need}")
-    return vals.reshape(len(FILMS), len(PAPERS), 4)
-
-
 # ---------------------------------------------------------------------------- codegen
 
 def _name(prof, key):
@@ -171,13 +237,23 @@ def _name(prof, key):
 
 
 def emit_swift(wb):
-    films = [(k, _name(p, k), p.get("info", {}).get("type") == "positive") for k in FILMS for p in [_load(k)]]
+    films = [(k, _name(p, k), p.get("info", {}).get("type") == "positive",
+              p.get("info", {}).get("antihalation", "strong"),
+              p.get("info", {}).get("target_print"))
+             for k in FILMS for p in [_load(k)]]
     papers = [(k, _name(_load(k), k)) for k in PAPERS]
+    if bad := {ah for _, _, _, ah, _ in films} - {"strong", "weak", "no"}:
+        raise SystemExit(f"unexpected antihalation classes {bad}")
+    if bad := {tp for _, _, _, _, tp in films if tp is not None} - set(PAPERS):
+        raise SystemExit(f"target_print stocks missing from PAPERS: {bad}")
     L = [
         "// Generated by scripts/filmsim_bake.py — do not edit by hand.",
-        "// Ordered film/paper stocks for the spectral film simulation, plus the",
-        "// precomputed neutral enlarger balance per film×paper (optimised for this pipeline).",
+        "// Ordered film/paper stocks for spectral film simulation",
         "import simd",
+        "",
+        "public enum Antihalation: String, Sendable, Hashable {",
+        "    case strong, weak, no",
+        "}",
         "",
         "/// One selectable emulsion. `index` is the value handed to the kernel:",
         "/// `film` (0..<paperOffset) for films, relative 0-based `paper` for papers.",
@@ -188,6 +264,10 @@ def emit_swift(wb):
         "    public let isPaper: Bool",
         "    /// Reversal (slide) stock — best viewed via the scanned-positive path, not an RA4 print.",
         "    public let isPositive: Bool",
+        "    /// Films: anti-halation class from the profile. Papers: always `.strong`.",
+        "    public let antihalation: Antihalation",
+        "    /// The profile's companion print stock (`target_print`), if any.",
+        "    public let targetPaperKey: String?",
         "    public var id: String { (isPaper ? \"paper:\" : \"film:\") + key }",
         "}",
         "",
@@ -197,10 +277,14 @@ def emit_swift(wb):
         "",
         "    public static let films: [FilmStock] = [",
     ]
-    L += [f'        FilmStock(index: {i}, key: "{k}", name: "{n}", isPaper: false, isPositive: {str(pos).lower()}),'
-          for i, (k, n, pos) in enumerate(films)]
+    def swift_str(s):
+        return f'"{s}"' if s is not None else "nil"
+    L += [f'        FilmStock(index: {i}, key: "{k}", name: "{n}", isPaper: false, '
+          f'isPositive: {str(pos).lower()}, antihalation: .{ah}, targetPaperKey: {swift_str(tp)}),'
+          for i, (k, n, pos, ah, tp) in enumerate(films)]
     L += ["    ]", "", "    public static let papers: [FilmStock] = ["]
-    L += [f'        FilmStock(index: {i}, key: "{k}", name: "{n}", isPaper: true, isPositive: false),'
+    L += [f'        FilmStock(index: {i}, key: "{k}", name: "{n}", isPaper: true, '
+          f'isPositive: false, antihalation: .strong, targetPaperKey: nil),'
           for i, (k, n) in enumerate(papers)]
     L += [
         "    ]",
@@ -335,8 +419,7 @@ def _smoothstep(e0, e1, x):
     return t * t * (3.0 - 2.0 * t)
 
 
-def _envelope(w):
-    return 1000.0 * _smoothstep(380.0, 400.0, w) * (1.0 - _smoothstep(700.0, 730.0, w))
+ENVELOPE_SCALE = 1000.0
 
 
 def _thorlabs(w):
@@ -394,7 +477,7 @@ def ref_build_tables(p):
     film, paper = p["film"], p["paper_offset"] + p["paper"]
     print_ = p["process"] == 0
     cols = np.arange(41) * 2
-    t = {"expose_factor": _get_sens(film, cols) * (_envelope(LAM) / (2.0 * 41.0))[:, None]}
+    t = {"expose_factor": _get_sens(film, cols) * (ENVELOPE_SCALE / (2.0 * 41.0))}
 
     scan_stock = paper if print_ else film
     scan_min = 0.4 if print_ else 1.0
@@ -511,8 +594,11 @@ def main():
     try:
         wb = optimize_wb()
     except ImportError:
-        print("  scipy unavailable; falling back to vkdt wb.h reference balance")
-        wb = parse_wb()
+        # vkdt's wb.h balance was solved without the per-stock adaptation windows now
+        # baked into the sensitivities, so it no longer transfers
+        print("error: SciPy is required for the neutral-balance solve (pip install scipy)",
+              file=sys.stderr)
+        return 1
     emit_swift(wb)
 
     print("verifying:")

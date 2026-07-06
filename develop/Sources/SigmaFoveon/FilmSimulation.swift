@@ -20,6 +20,11 @@ public struct FilmSimSettings: Sendable, Equatable, Hashable, Codable {
     public var grain = true
     public var grainSize: Float = 1
     public var grainUniformity: Float = 1
+    /// Grain post-scale (1 = the model's physical amplitude).
+    public var grainAmount: Float = 1
+    /// 1 = independent per-layer dye clouds, 0 = fully coupled (monochrome) grain
+    public var grainSaturation: Float = 1
+    /// Development-contrast trim
     public var gammaFilm: Float = 1
     public var gammaPaper: Float = 1
     public var filterC: Float? = nil       // nil → neutral-balance default
@@ -36,6 +41,8 @@ public struct FilmSimSettings: Sendable, Equatable, Hashable, Codable {
     /// Halation: a soft reddish glow bleeding out of the highlights.
     public var halation = false
     public var halationStrength: Float = 0.35  // halo scale (vkdt `scale`)
+    /// Per-channel halo strength; nil → the stock's anti-halation class default.
+    public var halationColor: SIMD3<Float>? = nil
     public var halationRadius: Float = 0.0015  // fraction of the long edge
     public var halationMidtones: Float = 0      // highlight protection (1 = brightest only)
 
@@ -46,6 +53,7 @@ public struct FilmSimSettings: Sendable, Equatable, Hashable, Codable {
         let f = min(max(film, 0), FilmSimData.films.count - 1)
         let p = min(max(paper, 0), FilmSimData.papers.count - 1)
         let wb = FilmSimData.neutralWB[f][p]      // (printEV, filterC, filterM, filterY)
+        let hal = halationColor ?? FilmSimData.films[f].antihalation.halationColor
         return FilmSimParams(
             process: negative ? 1 : 0, film: Int32(f), paper: Int32(p),
             paperOffset: Int32(FilmSimData.paperOffset),
@@ -60,7 +68,10 @@ public struct FilmSimSettings: Sendable, Equatable, Hashable, Codable {
             halation: halation ? 1 : 0,
             halationScale: halation ? max(0, halationStrength) : 0,
             halationMidtones: min(max(halationMidtones, 0), 1),
+            halationR: hal.x, halationG: hal.y, halationB: hal.z,
             couplersDiffused: (couplers > 0 && couplersRadius > 0) ? 1 : 0,
+            grainAmount: max(0, grainAmount),
+            grainSaturation: min(max(grainSaturation, 0), 1),
             seed: seed)
     }
 }
@@ -74,7 +85,10 @@ struct FilmSimParams: Equatable {
     var tuneM: Float; var tuneY: Float
     var grain: Int32; var grainSize: Float; var grainUniformity: Float
     var preflash: Int32; var pfEV: Float; var pfM: Float; var pfY: Float
-    var halation: Int32; var halationScale: Float; var halationMidtones: Float; var couplersDiffused: Int32
+    var halation: Int32; var halationScale: Float; var halationMidtones: Float
+    var halationR: Float; var halationG: Float; var halationB: Float
+    var couplersDiffused: Int32
+    var grainAmount: Float; var grainSaturation: Float
     var seed: UInt32
 }
 
@@ -84,7 +98,9 @@ extension FilmSimParams {
         var k = self
         k.evFilm = 0; k.gammaFilm = 0; k.gammaPaper = 0
         k.grain = 0; k.grainSize = 0; k.grainUniformity = 0
+        k.grainAmount = 0; k.grainSaturation = 0
         k.halation = 0; k.halationScale = 0; k.halationMidtones = 0
+        k.halationR = 0; k.halationG = 0; k.halationB = 0
         k.couplersDiffused = 0; k.seed = 0
         return k
     }
@@ -126,8 +142,13 @@ final class FilmSimulation: @unchecked Sendable {
         self.queue = queue
         guard let libURL = filmSimMetalLibraryURL else { throw FilmSimError.missingResource("FilmSim metallib") }
         let library = try device.makeLibrary(URL: libURL)
+        // Specialise the curve lookup: fixed-function bilinear on hardware that filters
+        // rgba32Float (Apple9+ / Mac), manual float32 lerp on older iPhones
+        let constants = MTLFunctionConstantValues()
+        var hwFilter = device.supports32BitFloatFiltering
+        constants.setConstantValue(&hwFilter, type: .bool, index: 0)
         func pipeline(_ name: String) throws -> MTLComputePipelineState {
-            guard let fn = library.makeFunction(name: name) else { throw FilmSimError.missingResource("kernel \(name)") }
+            let fn = try library.makeFunction(name: name, constantValues: constants)
             return try device.makeComputePipelineState(function: fn)
         }
         self.setup = try pipeline("filmsimSetup")
@@ -190,8 +211,8 @@ final class FilmSimulation: @unchecked Sendable {
         enc.setTexture(film, index: 1)
         enc.setBytes(&p, length: MemoryLayout<FilmSimParams>.stride, index: 0)
         enc.setBuffer(buffer, offset: 0, index: 1)
-        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.dispatchThreads(MTLSize(width: 41, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 41, height: 1, depth: 1))
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -322,7 +343,11 @@ final class FilmSimProcessor: CIImageProcessorKernel {
                                                     Int32(output.region.origin.y)),
                                scale: ctx.scale)
         enc.setBytes(&tile, length: MemoryLayout<FilmSimTile>.stride, index: 2)
-        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        // 16×8 measured fastest on M4 across the fused/spatial paths
+        // 4 simdgroups hide the LUT/texture latency of
+        // these register-heavy kernels better than larger groups
+        let h = min(8, max(1, stage.pipeline.maxTotalThreadsPerThreadgroup / 16))
+        let tg = MTLSize(width: 16, height: h, depth: 1)
         enc.dispatchThreads(MTLSize(width: dst.width, height: dst.height, depth: 1), threadsPerThreadgroup: tg)
         enc.endEncoding()
     }

@@ -196,11 +196,15 @@ final class WaveletDenoiseProcessor: CIImageProcessorKernel {
         let (coarse0, coarse1, removed0, removed1) = (t[0], t[1], t[2], t[3])
         cb.addCompletedHandler { _ in sim.giveBack(lease) }
 
-        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        // 16×16: the tg sweep showed 0 benefit from other shapes à-trous scatter reads
+        func tgSize(_ p: MTLComputePipelineState) -> MTLSize {
+            MTLSize(width: 16, height: max(1, min(16, p.maxTotalThreadsPerThreadgroup / 16)), depth: 1)
+        }
         let full = MTLSize(width: src.width, height: src.height, depth: 1)
         let plen = MemoryLayout<DenoiseKernelParams>.stride
 
         enc.setComputePipelineState(sim.atrous)
+        let atrousTG = tgSize(sim.atrous)
         var cur = src
         var removed = removed0                      // meaningless on level 0 (`first`)
         for level in 0..<waveletLevels {
@@ -220,7 +224,7 @@ final class WaveletDenoiseProcessor: CIImageProcessorKernel {
             enc.setBytes(&params, length: plen, index: 0)
             // A serial compute encoder executes dispatches in encode order with
             // coherent memory, so the ping-pong needs no explicit barriers.
-            enc.dispatchThreads(full, threadsPerThreadgroup: tg)
+            enc.dispatchThreads(full, threadsPerThreadgroup: atrousTG)
             cur = coarseOut
             removed = removedOut
         }
@@ -235,7 +239,7 @@ final class WaveletDenoiseProcessor: CIImageProcessorKernel {
         enc.setTexture(dst, index: 2)
         enc.setBytes(&padArg, length: MemoryLayout<SIMD2<Int32>>.stride, index: 0)
         enc.dispatchThreads(MTLSize(width: dst.width, height: dst.height, depth: 1),
-                            threadsPerThreadgroup: tg)
+                            threadsPerThreadgroup: tgSize(sim.assemble))
         enc.endEncoding()
     }
 

@@ -32,7 +32,12 @@ struct FilmSimParams {
     int   halation;         // 1 → the develop pass emits linear exposure for the halation blur
     float halation_scale;   // halo amount (0 disables)
     float halation_midtones;// highlight protection (0 = all tones, 1 = brightest only)
+    float halation_r;       // per-channel halo strength
+    float halation_g;       // the stock's anti-halation class (see FilmDefaults)
+    float halation_b;
     int   couplers_diffused;// 1 → the develop pass reads a spatially-diffused coupler input
+    float grain_amount;     // grain post-scale (1 = physical amplitude)
+    float grain_saturation; // 1 = independent RGB, 0 = fully coupled monochrome grain
     uint  seed;             // grain seed (deterministic per render)
 };
 
@@ -150,24 +155,25 @@ inline void sigmoid_both(float3 x, thread float3 &sig, thread float3 &sig_d) {
     sig_d = 0.5 * rcp / base;
 }
 
-constexpr sampler lut_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
-
 // film LUT has NaN sentinels for unmeasured spectral rows, but Metal's fast-math folds them :DDDDDD
 inline bool3 nan_bits(float3 v) { return (as_type<uint3>(v) & 0x7fffffff) > 0x7f800000; }
 inline bool4 nan_bits(float4 v) { return (as_type<uint4>(v) & 0x7fffffff) > 0x7f800000; }
 
-inline float get_tcy(int type, int stock, float height) {
-    return (stock * 3 + type + 0.5) / height;
-}
-inline float3 get_sensitivity(float2 tc, texture2d<float, access::sample> img_filmsim) {
-    float3 log_sensitivity = img_filmsim.sample(lut_sampler, tc).rgb;
+// The LUT is rgba32Float, which is only filterable on Apple9+ (A17 Pro / M3). The host
+// specialises the pipelines on MTLDevice.supports32BitFloatFiltering
+constant bool hw_float_filtering [[function_constant(0)]];
+// Pixel coords: y = row + 0.5 is exact (normalised y = (row+0.5)/84 isn't representable
+// and can bleed the adjacent row — a different data type — into the lookup).
+constexpr sampler lut_sampler(coord::pixel, filter::linear, address::clamp_to_edge);
+
+inline uint lut_row(int type, int stock) { return uint(stock * 3 + type); }
+inline float3 get_sensitivity(uint x, uint row, texture2d<float, access::sample> img_filmsim) {
+    float3 log_sensitivity = img_filmsim.read(uint2(x, row)).rgb;
     return select(exp2(log_sensitivity * log2_10), float3(0.0), nan_bits(log_sensitivity));
 }
 
-// smoothstep window that kills wavelengths outside the XYZ support (head/filmsim.glsl).
-inline float envelope(float w) {
-    return 1000.0 * smoothstep(380.0, 400.0, w) * (1.0 - smoothstep(700.0, 730.0, w));
-}
+// The UV/IR band-pass lives in the baked sensitivities
+constant float envelope_scale = 1000.0;
 
 // Coarse fit to the Thorlabs enlarger dichroic filters (filmsim.glsl).
 inline float3 thorlabs_filters(float w) {
@@ -188,7 +194,7 @@ inline float3x3 coupler_matrix(float couplers) {
     return M;
 }
 
-/// Precompute the spectral integration tables 
+/// Precompute the spectral integration tables
 kernel void filmsimSetup(
     texture2d<float, access::read>   img_coeff   [[texture(0)]],
     texture2d<float, access::sample> img_filmsim [[texture(1)]],
@@ -196,18 +202,11 @@ kernel void filmsimSetup(
     device   FilmTables             &t           [[buffer(1)]],
     uint tid [[thread_position_in_grid]])
 {
-    if (tid != 0) return;
-    float height = img_filmsim.get_height();
+    threadgroup float3 pf_partial[41];
+    int i = int(tid);
     int film  = params.film;
     int paper = params.paper_offset + params.paper;
     bool print = params.process == 0;
-
-    // DIR coupler diffusion matrix (interlayer inhibition), init_coupler_matrix_shared.
-    float3x3 M = coupler_matrix(params.couplers);
-    t.M0 = float4(M[0], 0.0);
-    t.M1 = float4(M[1], 0.0);
-    t.M2 = float4(M[2], 0.0);
-    t.M_sum = float4(M * float3(1.0), 0.0);
 
     // Scan illuminant chromaticity is a fixed D50 upsample (init_scan_shared).
     float4 coeff_d50 = fetch_coeff(float3(0.9642, 1.0000, 0.8251), img_coeff);
@@ -215,60 +214,72 @@ kernel void filmsimSetup(
     float scan_factor_min = print ? dye_density_min_factor_paper : dye_density_min_factor_film;
     float scan_illum_scale = (print ? 4.0 : 4.7) / 41.0;
 
+    // This wavelength's rows: the 10nm integration grid over the 5nm-sampled LUT.
+    float lambda = 380.0 + i * 10.0;
+    uint tx = uint(i * 2);
     float3 preflash = float3(0.0);
-    for (int i = 0; i < SN; ++i) {
-        float lambda = 380.0 + i * 10.0;
-        float2 tcx = float2((i * 2.0 + 0.5) / 256.0, 0.0);
 
-        {
-            float3 sens = get_sensitivity(float2(tcx.x, get_tcy(s_sensitivity, film, height)), img_filmsim);
-            float pdf = 2.0 * 41.0; // integration is -1 EV vs agx, hence the 2.0
-            t.expose_factor[i] = float4(sens * envelope(lambda) / pdf, 0.0);
-        }
-
-        {
-            float4 dye = img_filmsim.sample(lut_sampler, float2(tcx.x, get_tcy(s_dye_density, scan_stock, height)));
-            dye = select(dye, float4(1000.0), nan_bits(dye));
-            float3 dye_xyz = min(dye.xyz * log2_10, 300.0);
-            float base_light = exp2(-(dye.w * scan_factor_min) * log2_10);
-            float scan_illum = scan_illum_scale * sigmoid_eval(coeff_d50, lambda);
-            t.scan_dye[i]    = float4(dye_xyz, 0.0);
-            t.scan_factor[i] = float4(scan_illum * cmf_1931(lambda) * base_light, 0.0);
-        }
-
-        if (print) {
-            float3 paper_sens = get_sensitivity(float2(tcx.x, get_tcy(s_sensitivity, paper, height)), img_filmsim);
-            float4 film_dye = img_filmsim.sample(lut_sampler, float2(tcx.x, get_tcy(s_dye_density, film, height)));
-            film_dye = select(film_dye, float4(1000000.0), nan_bits(film_dye));
-
-            float3 neutral = clamp(float3(params.filter_c,
-                                          clamp(params.filter_m, 0.0, 1.0) + 0.1 * params.tune_m,
-                                          clamp(params.filter_y, 0.0, 1.0) + 0.1 * params.tune_y),
-                                   0.0, 1.0);
-            float illuminant = 0.002 * colour_blackbody(lambda, 2856.0);
-            float base_light = exp2(-(film_dye.w * dye_density_min_factor_film) * log2_10);
-            float common_light = illuminant * base_light * exp2(params.ev_paper) * 1000000.0;
-            float3 enl = mix(float3(1.0), thorlabs_filters(lambda), neutral);
-            float print_illuminant = enl.x * enl.y * enl.z * common_light;
-
-            t.enlarger_dye[i]    = float4(film_dye.xyz * log2_10, 0.0);
-            t.enlarger_factor[i] = float4(paper_sens * print_illuminant, 0.0);
-
-            if (params.preflash != 0) {
-                float3 pf_neutral = clamp(float3(params.filter_c,
-                                                 clamp(params.filter_m, 0.0, 1.0) + 0.1 * params.tune_m + params.pf_m,
-                                                 clamp(params.filter_y, 0.0, 1.0) + 0.1 * params.tune_y + params.pf_y),
-                                          0.0, 1.0);
-                float3 pf_enl = mix(float3(1.0), thorlabs_filters(lambda), pf_neutral);
-                float pf_illum = pf_enl.x * pf_enl.y * pf_enl.z * common_light * exp2(params.pf_ev);
-                preflash += paper_sens * pf_illum;
-            }
-        } else {
-            t.enlarger_dye[i]    = float4(0.0);
-            t.enlarger_factor[i] = float4(0.0);
-        }
+    {
+        float3 sens = get_sensitivity(tx, lut_row(s_sensitivity, film), img_filmsim);
+        float pdf = 2.0 * 41.0; // integration is -1 EV vs agx, hence the 2.0
+        t.expose_factor[i] = float4(sens * (envelope_scale / pdf), 0.0);
     }
-    t.preflash = float4(preflash, 0.0);
+
+    {
+        float4 dye = img_filmsim.read(uint2(tx, lut_row(s_dye_density, scan_stock)));
+        dye = select(dye, float4(1000.0), nan_bits(dye));
+        float3 dye_xyz = min(dye.xyz * log2_10, 300.0);
+        float base_light = exp2(-(dye.w * scan_factor_min) * log2_10);
+        float scan_illum = scan_illum_scale * sigmoid_eval(coeff_d50, lambda);
+        t.scan_dye[i]    = float4(dye_xyz, 0.0);
+        t.scan_factor[i] = float4(scan_illum * cmf_1931(lambda) * base_light, 0.0);
+    }
+
+    if (print) {
+        float3 paper_sens = get_sensitivity(tx, lut_row(s_sensitivity, paper), img_filmsim);
+        float4 film_dye = img_filmsim.read(uint2(tx, lut_row(s_dye_density, film)));
+        film_dye = select(film_dye, float4(1000000.0), nan_bits(film_dye));
+
+        float3 neutral = clamp(float3(params.filter_c,
+                                      clamp(params.filter_m, 0.0, 1.0) + 0.1 * params.tune_m,
+                                      clamp(params.filter_y, 0.0, 1.0) + 0.1 * params.tune_y),
+                               0.0, 1.0);
+        float illuminant = 0.002 * colour_blackbody(lambda, 2856.0);
+        float base_light = exp2(-(film_dye.w * dye_density_min_factor_film) * log2_10);
+        float common_light = illuminant * base_light * exp2(params.ev_paper) * 1000000.0;
+        float3 enl = mix(float3(1.0), thorlabs_filters(lambda), neutral);
+        float print_illuminant = enl.x * enl.y * enl.z * common_light;
+
+        t.enlarger_dye[i]    = float4(film_dye.xyz * log2_10, 0.0);
+        t.enlarger_factor[i] = float4(paper_sens * print_illuminant, 0.0);
+
+        if (params.preflash != 0) {
+            float3 pf_neutral = clamp(float3(params.filter_c,
+                                             clamp(params.filter_m, 0.0, 1.0) + 0.1 * params.tune_m + params.pf_m,
+                                             clamp(params.filter_y, 0.0, 1.0) + 0.1 * params.tune_y + params.pf_y),
+                                      0.0, 1.0);
+            float3 pf_enl = mix(float3(1.0), thorlabs_filters(lambda), pf_neutral);
+            float pf_illum = pf_enl.x * pf_enl.y * pf_enl.z * common_light * exp2(params.pf_ev);
+            preflash = paper_sens * pf_illum;
+        }
+    } else {
+        t.enlarger_dye[i]    = float4(0.0);
+        t.enlarger_factor[i] = float4(0.0);
+    }
+
+    pf_partial[i] = preflash;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i == 0) {
+        // DIR coupler diffusion matrix (interlayer inhibition)
+        float3x3 M = coupler_matrix(params.couplers);
+        t.M0 = float4(M[0], 0.0);
+        t.M1 = float4(M[1], 0.0);
+        t.M2 = float4(M[2], 0.0);
+        t.M_sum = float4(M * float3(1.0), 0.0);
+        float3 pf = float3(0.0);
+        for (int k = 0; k < SN; ++k) pf += pf_partial[k];
+        t.preflash = float4(pf, 0.0);
+    }
 }
 
 inline float3 mulM(constant FilmTables &t, float3 v) {
@@ -372,18 +383,37 @@ inline float3 add_grain(int2 ipos, float3 density, float scale, constant FilmSim
     float3 bn1 = acc1 * 1.73205 * rsqrt(max(wsq1, 1e-6));
     float3 bn2 = acc2 * 1.73205 * rsqrt(max(wsq2, 1e-6));
     float3 noise = bn0 * std_0 + bn1 * std_1 + bn2 * std_2;
+    // Post controls
+    float mono = (noise.r + noise.g + noise.b) * (1.0 / 3.0);
+    noise = mix(float3(mono), noise, clamp(p.grain_saturation, 0.0, 1.0)) * max(p.grain_amount, 0.0);
     return clamp(density + noise, float3(0.0), float3(2.0));
 }
 
-/// Characteristic curve lookup
+/// Characteristic curve lookup on the 256-texel logE row. Compile-time specialised
+/// fixed-function bilinear where 32-bit float filtering exists (Apple9+, Mac), manual
+/// float32 lerp on older iOS hardware where sampling rgba32Float is undefined.
 inline float3 develop_curve(float3 log_raw, float gamma, int stock,
                             texture2d<float, access::sample> img_filmsim) {
-    float height = img_filmsim.get_height();
-    float y = get_tcy(s_density_curve, stock, height);
-    float3 tcx = clamp((gamma * log_raw + 4.0) / 8.0, 0.0, 1.0);   // logE domain [-4, 4]
-    float3 d = float3(img_filmsim.sample(lut_sampler, float2(tcx.r, y)).r,
-                      img_filmsim.sample(lut_sampler, float2(tcx.g, y)).g,
-                      img_filmsim.sample(lut_sampler, float2(tcx.b, y)).b);
+    uint row = lut_row(s_density_curve, stock);
+    float3 d;
+    if (hw_float_filtering) {
+        float y = row + 0.5;
+        // logE domain [-4, 4] over 256 texels; clamp_to_edge covers the ends
+        float3 tcx = (gamma * log_raw + 4.0) * 32.0;
+        d = float3(img_filmsim.sample(lut_sampler, float2(tcx.r, y)).r,
+                   img_filmsim.sample(lut_sampler, float2(tcx.g, y)).g,
+                   img_filmsim.sample(lut_sampler, float2(tcx.b, y)).b);
+    } else {
+        float3 xf = clamp((gamma * log_raw + 4.0) * 32.0 - 0.5, 0.0, 255.0);
+        float3 x0 = floor(xf);
+        float3 f = xf - x0;
+        uint3 i0 = uint3(x0);
+        uint3 i1 = min(i0 + 1, 255u);
+        d = float3(
+            mix(img_filmsim.read(uint2(i0.x, row)).r, img_filmsim.read(uint2(i1.x, row)).r, f.x),
+            mix(img_filmsim.read(uint2(i0.y, row)).g, img_filmsim.read(uint2(i1.y, row)).g, f.y),
+            mix(img_filmsim.read(uint2(i0.z, row)).b, img_filmsim.read(uint2(i1.z, row)).b, f.z));
+    }
     return select(d, float3(0.0), nan_bits(d));
 }
 
@@ -422,7 +452,9 @@ inline float3 develop_to_rgb(float3 log_raw, int2 ipos, float scale, constant Fi
 
 // All per-pixel kernels share the same binding layout: input(s) at texture 0 (and 1),
 // output at texture 2, the coeff/film LUTs at 3/4, and params/tables/tile-origin at
-// buffers 0/1/2. The blur stages between them are CI CIGaussianBlur
+// buffers 0/1/2. The blur stages between them are CI CIGaussianBlur. The host uses
+// dispatchThreads (non-uniform threadgroups), so the grid never exceeds the output
+// and no bounds guards are needed.
 
 kernel void filmsimProcess(
     texture2d<float, access::read>   img_in      [[texture(0)]],
@@ -434,7 +466,6 @@ kernel void filmsimProcess(
     constant FilmSimTile            &tile        [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= img_out.get_width() || gid.y >= img_out.get_height()) return;
     float3 log_raw = expose_film(rec709_to_rec2020(img_in.read(gid).rgb), p, t, img_coeff);
     if (p.couplers > 0.0)
         log_raw = correct_exposure(log_raw, mulM(t, sigmoid(log_raw)), p, t);
@@ -451,7 +482,6 @@ kernel void filmsimExpose(
     constant FilmTables            &t         [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= img_out.get_width() || gid.y >= img_out.get_height()) return;
     float3 log_raw = expose_film(rec709_to_rec2020(img_in.read(gid).rgb), p, t, img_coeff);
     img_out.write(float4(clamp(log_raw, -10.0, 10.0), 1.0), gid);
 }
@@ -463,7 +493,6 @@ kernel void filmsimCoupler(
     constant FilmSimParams         &p          [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= img_out.get_width() || gid.y >= img_out.get_height()) return;
     float3 coupler = coupler_matrix(p.couplers) * sigmoid(img_logexp.read(gid).rgb);
     img_out.write(float4(clamp(coupler, -10.0, 10.0), 1.0), gid);
 }
@@ -480,7 +509,6 @@ kernel void filmsimDevelop(
     constant FilmSimTile            &tile        [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= img_out.get_width() || gid.y >= img_out.get_height()) return;
     float3 log_raw = img_logexp.read(gid).rgb;
     // Couplers are diffused (blurred) upstream, or formed per-pixel right here when they aren't.
     float3 coupler = p.couplers_diffused != 0 ? img_coupler.read(gid).rgb
@@ -504,12 +532,12 @@ kernel void filmsimPrint(
     constant FilmSimTile            &tile        [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= img_out.get_width() || gid.y >= img_out.get_height()) return;
     float3 raw = img_raw.read(gid).rgb;
     float3 hal = img_hal.read(gid).rgb;
-    const float3 strength = float3(0.8, 0.05, 0.01);
+    // Per-channel halo strength follows the stock's anti-halation class (host-set)
+    const float3 strength = float3(p.halation_r, p.halation_g, p.halation_b);
     float3 hs = p.halation_scale * strength;
-    float x = max(0.0, (hal.x + hal.y + hal.z) / (strength.x + strength.y + strength.z));
+    float x = max(0.0, (hal.x + hal.y + hal.z) / max(strength.x + strength.y + strength.z, 1e-4));
     float prot = exp2(-4.32808512266689 * p.halation_midtones / (1e-3 + 0.01 * x * x));  // -3·log2(e)·mids
     hs *= prot;
     float3 log_raw = log2((raw + hs * hal) / (1.0 + hs)) * log10_2;

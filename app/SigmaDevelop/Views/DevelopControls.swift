@@ -385,8 +385,8 @@ private struct DenoiseControl: View {
     private var caption: String {
         switch mode {
         case .off: ""
-        case .wavelet: "Profiled"
-        case .neural: "Core ML"
+        case .wavelet: "{Wavelet}"
+        case .neural: "{CoreML}"
         }
     }
 }
@@ -395,7 +395,7 @@ private extension DenoiseMode {
     var label: String {
         switch self {
         case .off: "Off"
-        case .wavelet: "Wavelet"
+        case .wavelet: "Profiled"
         case .neural: "Neural"
         }
     }
@@ -526,11 +526,22 @@ private struct FilmControl: View {
                     Toggle("Grain", isOn: $film.grain)
                 }
 
-                Divider()
-                LabeledSlider("Grain size", value: $film.grainSize, in: 0.25...4) {
-                    String(format: "%.2f×", $0)
+                Disclosure(shown: film.grain) {
+                    Divider()
+                    LabeledSlider("Grain size", value: $film.grainSize, in: 0.25...4) {
+                        String(format: "%.2f×", $0)
+                    }
+
+                    Divider()
+                    LabeledSlider("Grain amount", value: $film.grainAmount, in: 0...2) {
+                        String(format: "%.2f×", $0)
+                    }
+
+                    Divider()
+                    LabeledSlider("Grain color", value: $film.grainSaturation, in: 0...1) {
+                        abs($0) < 0.01 ? "Mono" : String(format: "%.2f", $0)
+                    }
                 }
-                .disabled(!film.grain)
             }
         }
         .onChange(of: film.film) { _, new in
