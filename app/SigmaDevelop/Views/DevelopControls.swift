@@ -128,16 +128,6 @@ struct DevelopControls: View {
 
             Divider()
 
-            SettingRow {
-                Toggle("Monochrome", isOn: $settings.monochrome)
-            }
-
-            Divider()
-
-            FilmControl(enabled: $settings.filmEnabled, film: $settings.film)
-
-            Divider()
-
             LabeledSlider("Contrast", value: contrastBinding, in: -0.5...0.5) {
                 abs($0) < 0.01 ? "Off" : String(format: "%+.2f", $0)
             }
@@ -147,6 +137,16 @@ struct DevelopControls: View {
             LabeledSlider("Sharpness", value: $settings.sharpness, in: 0...2) {
                 String(format: "%.2f", $0)
             }
+
+            Divider()
+
+            SettingRow {
+                Toggle("Monochrome", isOn: $settings.monochrome)
+            }
+
+            Divider()
+
+            FilmControl(enabled: $settings.filmEnabled, film: $settings.film)
 
             Divider()
 

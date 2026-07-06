@@ -51,6 +51,16 @@ public struct DevelopedImage: @unchecked Sendable {
 /// Proxy cap for interactive decodes
 let proxyMaxDimension: CGFloat = 2560
 
+extension CGRect {
+    /// The largest integral rect contained in `self` (`integral` rounds outward).
+    var insideIntegral: CGRect {
+        let r = CGRect(x: minX.rounded(.up), y: minY.rounded(.up),
+                       width: maxX.rounded(.down) - minX.rounded(.up),
+                       height: maxY.rounded(.down) - minY.rounded(.up))
+        return r.isEmpty ? .zero : r
+    }
+}
+
 extension FoveonDeveloper {
 
     /// Decode `.x3f` bytes to a reusable scene-linear image
@@ -149,7 +159,11 @@ extension FoveonDeveloper {
             // under the 2560 preview cap, so zoom magnifies real pixels).
             if longest > CGFloat(maxDimension) * 5 / 4 {
                 let s = CGFloat(maxDimension) / longest
-                image = image.transformed(by: CGAffineTransform(scaleX: s, y: s))
+                let t = CGAffineTransform(scaleX: s, y: s)
+                // `transformed` rounds the reported extent outward; crop the
+                // partially-covered edge row (a faint bar otherwise) away by
+                // intersecting with the exact scaled rect's interior.
+                image = image.transformed(by: t).cropped(to: image.extent.applying(t).insideIntegral)
                 scale *= Float(s)
             }
         }

@@ -102,11 +102,12 @@ struct DetailView: View {
                 // Tiles engage only when the base preview undersells the file's
                 // native grid — resolution-driven, so it holds for RAW and X3F
                 // alike (an X3F at the native 2640 grid never tiles; anything
-                // rendered under the cap does). Film sim is excluded because
-                // grain reseeds per render and would seam against the base.
+                // rendered under the cap does). Film sim tiles too: grain is
+                // seeded deterministically and locked to the full-res pixel
+                // grid (tile origin × scale), so tiles agree with the base.
                 ZoomableImage(image: preview, isHDR: previewIsHDR, tile: zoomTile,
                               insetH: SigmaTheme.stageInsetH, insetV: SigmaTheme.stageInsetV,
-                              onTileNeeded: settings.filmEnabled || previewIsNativeRes ? nil : handleTileRequest)
+                              onTileNeeded: previewIsNativeRes ? nil : handleTileRequest)
             } else if let thumb = store.thumbnails[item.id] {
                 Image(uiImage: thumb)
                     .resizable()
