@@ -299,6 +299,9 @@ private struct FilmSimTile {
     var origin: SIMD2<Int32>
     var scale: Float
     var pad: Float = 0
+    /// Texel offsets of the output region within each input texture (see process()).
+    var in0: SIMD2<Int32>
+    var in1: SIMD2<Int32>
 }
 
 // MARK: - Core Image processor node
@@ -348,9 +351,22 @@ final class FilmSimProcessor: CIImageProcessorKernel {
         // stable top-down image coordinate — identical whether CI renders the
         // frame whole, in internal tiles, or as a zoomed region crop. Grain is
         // seeded from this coordinate, so it must not depend on the tiling.
-        var tile = FilmSimTile(origin: SIMD2<Int32>(Int32((output.region.minX - ctx.extent.minX).rounded()),
-                                                    Int32((ctx.extent.maxY - output.region.maxY).rounded())),
-                               scale: ctx.scale)
+        //
+        // Input textures cover their own `region`, which CI only guarantees to
+        // *contain* the output ROI — cached/realigned intermediates shift it.
+        // Each read is offset by the region delta (top-down, like `gid`);
+        // reading at bare `gid` tears the image along CI's tile boundaries.
+        let out = output.region
+        func inputOffset(_ i: Int) -> SIMD2<Int32> {
+            guard i < inputs.count else { return .zero }
+            let r = inputs[i].region
+            return SIMD2(Int32((out.minX - r.minX).rounded()),
+                         Int32((r.maxY - out.maxY).rounded()))
+        }
+        var tile = FilmSimTile(origin: SIMD2<Int32>(Int32((out.minX - ctx.extent.minX).rounded()),
+                                                    Int32((ctx.extent.maxY - out.maxY).rounded())),
+                               scale: ctx.scale,
+                               in0: inputOffset(0), in1: inputOffset(1))
         enc.setBytes(&tile, length: MemoryLayout<FilmSimTile>.stride, index: 2)
         // 16×8 measured fastest on M4 across the fused/spatial paths
         // 4 simdgroups hide the LUT/texture latency of

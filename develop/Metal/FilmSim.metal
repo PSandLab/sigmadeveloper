@@ -46,6 +46,12 @@ struct FilmSimTile {
     int2  origin;
     float scale;
     float pad;
+    // Input textures cover each input's `region`, which Core Image only
+    // guarantees to *contain* the ROI — it may be larger or shifted (tile-grid
+    // alignment, cached intermediates). Reading at bare `gid` then tears the
+    // image along tile edges; add these per-input texel offsets instead.
+    int2  in0;
+    int2  in1;
 };
 
 // Precomputed spectral integration inputs
@@ -454,10 +460,14 @@ inline float3 develop_to_rgb(float3 log_raw, int2 ipos, float scale, constant Fi
 }
 
 // All per-pixel kernels share the same binding layout: input(s) at texture 0 (and 1),
-// output at texture 2, the coeff/film LUTs at 3/4, and params/tables/tile-origin at
+// output at texture 2, the coeff/film LUTs at 3/4, and params/tables/tile at
 // buffers 0/1/2. The blur stages between them are CI CIGaussianBlur. The host uses
 // dispatchThreads (non-uniform threadgroups), so the grid never exceeds the output
 // and no bounds guards are needed.
+
+/// Input texel for output texel `gid`: Core Image may hand inputs whose region
+/// is larger or shifted relative to the output's, so reads carry a per-input offset.
+inline uint2 in_at(uint2 gid, int2 offset) { return uint2(int2(gid) + offset); }
 
 kernel void filmsimProcess(
     texture2d<float, access::read>   img_in      [[texture(0)]],
@@ -469,7 +479,7 @@ kernel void filmsimProcess(
     constant FilmSimTile            &tile        [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    float3 log_raw = expose_film(rec709_to_rec2020(img_in.read(gid).rgb), p, t, img_coeff);
+    float3 log_raw = expose_film(rec709_to_rec2020(img_in.read(in_at(gid, tile.in0)).rgb), p, t, img_coeff);
     if (p.couplers > 0.0)
         log_raw = correct_exposure(log_raw, mulM(t, sigmoid(log_raw)), p, t);
     float3 rgb = develop_to_rgb(log_raw, tile.origin + int2(gid), tile.scale, p, t, img_filmsim);
@@ -483,9 +493,10 @@ kernel void filmsimExpose(
     texture2d<float, access::read>  img_coeff [[texture(3)]],
     constant FilmSimParams         &p         [[buffer(0)]],
     constant FilmTables            &t         [[buffer(1)]],
+    constant FilmSimTile           &tile      [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    float3 log_raw = expose_film(rec709_to_rec2020(img_in.read(gid).rgb), p, t, img_coeff);
+    float3 log_raw = expose_film(rec709_to_rec2020(img_in.read(in_at(gid, tile.in0)).rgb), p, t, img_coeff);
     img_out.write(float4(clamp(log_raw, -10.0, 10.0), 1.0), gid);
 }
 
@@ -494,9 +505,10 @@ kernel void filmsimCoupler(
     texture2d<float, access::read>  img_logexp [[texture(0)]],
     texture2d<float, access::write> img_out    [[texture(2)]],
     constant FilmSimParams         &p          [[buffer(0)]],
+    constant FilmSimTile           &tile       [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    float3 coupler = coupler_matrix(p.couplers) * sigmoid(img_logexp.read(gid).rgb);
+    float3 coupler = coupler_matrix(p.couplers) * sigmoid(img_logexp.read(in_at(gid, tile.in0)).rgb);
     img_out.write(float4(clamp(coupler, -10.0, 10.0), 1.0), gid);
 }
 
@@ -512,9 +524,9 @@ kernel void filmsimDevelop(
     constant FilmSimTile            &tile        [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    float3 log_raw = img_logexp.read(gid).rgb;
+    float3 log_raw = img_logexp.read(in_at(gid, tile.in0)).rgb;
     // Couplers are diffused (blurred) upstream, or formed per-pixel right here when they aren't.
-    float3 coupler = p.couplers_diffused != 0 ? img_coupler.read(gid).rgb
+    float3 coupler = p.couplers_diffused != 0 ? img_coupler.read(in_at(gid, tile.in1)).rgb
                                               : coupler_matrix(p.couplers) * sigmoid(log_raw);
     log_raw = correct_exposure(log_raw, coupler, p, t);
     if (p.halation != 0)
@@ -535,8 +547,8 @@ kernel void filmsimPrint(
     constant FilmSimTile            &tile        [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    float3 raw = img_raw.read(gid).rgb;
-    float3 hal = img_hal.read(gid).rgb;
+    float3 raw = img_raw.read(in_at(gid, tile.in0)).rgb;
+    float3 hal = img_hal.read(in_at(gid, tile.in1)).rgb;
     // Per-channel halo strength follows the stock's anti-halation class (host-set)
     const float3 strength = float3(p.halation_r, p.halation_g, p.halation_b);
     float3 hs = p.halation_scale * strength;
