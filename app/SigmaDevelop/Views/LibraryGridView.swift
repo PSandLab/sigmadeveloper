@@ -44,7 +44,7 @@ struct LibraryGridView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showOptions) { DevelopOptionsSheet() }
+            .sheet(isPresented: $showOptions) { DevelopOptionsSheet().environment(store) }
             .sheet(isPresented: $isSharing) { ShareSheet(items: shareItems) }
             .alert("Export Failed", isPresented: errorBinding) {
                 Button("OK", role: .cancel) { errorText = nil }

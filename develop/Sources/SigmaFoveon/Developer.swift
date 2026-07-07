@@ -356,11 +356,14 @@ public final class FoveonDeveloper: @unchecked Sendable {
         let longest = max(image.extent.width, image.extent.height)
         if longest > maxDimension {
             scale = maxDimension / longest
-            scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            // Integral per-axis scale: no partially-covered edge row (the faint
+            // bar), and the proxy covers the full frame exactly, keeping
+            // deep-zoom tile placement registered (see integralScaleTransform).
+            scaled = image.transformed(by: integralScaleTransform(image.extent, scale: scale))
         }
         // `deferred: false` forces the decode now; the default overload sometimes
         // hands back a lazily-backed CGImage that would re-decode on first use.
-        guard let bitmap = context.createCGImage(scaled, from: scaled.extent.integral, format: .RGBAh,
+        guard let bitmap = context.createCGImage(scaled, from: scaled.extent, format: .RGBAh,
                                                  colorSpace: extendedLinearSRGB, deferred: false) else {
             throw FoveonError.render("proxy rasterise failed")
         }

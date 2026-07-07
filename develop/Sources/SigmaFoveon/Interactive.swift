@@ -51,6 +51,16 @@ public struct DevelopedImage: @unchecked Sendable {
 /// Proxy cap for interactive decodes
 let proxyMaxDimension: CGFloat = 2560
 
+/// Snap a uniform downscale of `extent` to per-axis factors that land exactly on
+/// integral pixel sizes (≤0.5px aspect skew). A fractional scaled size leaves a
+/// partially-covered edge row — `CIImage` rounds its extent outward — that
+/// rasterises as a faint dark bar; cropping the row away instead misregisters
+/// deep-zoom tiles, which are placed as if the preview covers the full frame.
+func integralScaleTransform(_ extent: CGRect, scale s: CGFloat) -> CGAffineTransform {
+    CGAffineTransform(scaleX: (extent.width * s).rounded() / extent.width,
+                      y: (extent.height * s).rounded() / extent.height)
+}
+
 extension FoveonDeveloper {
 
     /// Decode `.x3f` bytes to a reusable scene-linear image
@@ -149,7 +159,7 @@ extension FoveonDeveloper {
             // under the 2560 preview cap, so zoom magnifies real pixels).
             if longest > CGFloat(maxDimension) * 5 / 4 {
                 let s = CGFloat(maxDimension) / longest
-                image = image.transformed(by: CGAffineTransform(scaleX: s, y: s))
+                image = image.transformed(by: integralScaleTransform(image.extent, scale: s))
                 scale *= Float(s)
             }
         }
