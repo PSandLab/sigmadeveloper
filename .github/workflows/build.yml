@@ -8,10 +8,10 @@ jobs:
     runs-on: macos-15
 
     steps:
-      # THE FIX: Tell GitHub Actions to fetch submodules (like spektrafilm)
       - uses: actions/checkout@v4
         with:
-          submodules: 'recursive' 
+          submodules: 'recursive'
+          lfs: true # <--- THIS IS THE FIX!
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_26.3.app
@@ -34,12 +34,12 @@ jobs:
           echo "Baking film simulations..."
           python scripts/filmsim_bake.py
           
-          # Safely run noise profile generation (only if dataset exists, to prevent crashes)
+          # Safely run noise profile generation
           echo "Checking for noise profile dataset..."
           if [ -d "dataset" ] || ls *.x3f 1> /dev/null 2>&1; then
             python scripts/noise_profile.py
           else
-            echo "No raw dataset found, skipping noise profile re-measurement. (Assuming NoiseProfiles.generated.swift is already committed)"
+            echo "No raw dataset found, skipping noise profile re-measurement."
           fi
 
       - name: Build Core Dependencies and Shaders
