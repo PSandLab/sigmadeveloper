@@ -5,12 +5,15 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build
+      - name: Select Xcode 26
+        run: sudo xcode-select -s /Applications/Xcode_26.app
+
+      - name: Build unsigned app
         run: |
           xcodebuild \
             -project app/SigmaDevelop.xcodeproj \
@@ -31,9 +34,10 @@ jobs:
           APP=$(find ~/Library/Developer/Xcode/DerivedData -name "SigmaDevelop.app" | head -n 1)
           mkdir Payload
           cp -R "$APP" Payload/
-          zip -r SigmaDevelop.ipa Payload
+          zip -qry SigmaDevelop.ipa Payload
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
         with:
           name: SigmaDevelop-ipa
           path: SigmaDevelop.ipa
