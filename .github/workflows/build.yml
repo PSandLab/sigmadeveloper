@@ -1,0 +1,39 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          xcodebuild \
+            -project app/SigmaDevelop.xcodeproj \
+            -scheme SigmaDevelop \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination generic/platform=iOS \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            clean build
+
+      - name: Create IPA
+        run: |
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "SigmaDevelop.app" | head -n 1)
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -r SigmaDevelop.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SigmaDevelop-ipa
+          path: SigmaDevelop.ipa
