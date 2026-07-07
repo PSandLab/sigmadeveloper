@@ -18,16 +18,35 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: Build dependencies and libraries
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Use a stable python version
+
+      - name: Generate Film Sims and Noise Profiles
         run: |
-          # Make scripts executable
+          # The README specifies these dependencies for the generation scripts
+          pip install numpy scipy
+          
+          # Generates .lut resources + FilmStocks.generated.swift
+          python scripts/filmsim_bake.py
+          
+          # Generates NoiseProfiles.generated.swift
+          python scripts/noise_profile.py
+
+      - name: Build Core Dependencies and Shaders
+        run: |
           chmod +x build_libs.sh
           chmod +x develop/build_metallib.sh
           chmod +x build_ios_libs.sh
           
-          # Run the build scripts in the required sequence
+          # Builds Kalpanika/x3f, libvips, and C/C++ engine dependencies
           ./build_libs.sh
+          
+          # Compiles Metal shaders into a .metallib binary
           ./develop/build_metallib.sh
+          
+          # Bundles everything for iOS architectures
           ./build_ios_libs.sh
 
       - name: Build unsigned app
