@@ -31,167 +31,78 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
 
-      - name: Verify Rust
-        run: |
-          rustc --version
-          cargo --version
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: |
-          pip install numpy scipy pillow
+        run: pip install numpy scipy pillow
 
       - name: Optional noise profile generation
         run: |
           if [ -d dataset ] || ls *.x3f >/dev/null 2>&1; then
-            echo "Building noise profile from dataset..."
             python scripts/noise_profile.py
           else
             echo "Using committed NoiseProfiles.generated.swift"
           fi
 
-      - name: Clean Xcode cache
-        run: |
-          rm -rf ~/Library/Developer/Xcode/DerivedData/*
-          rm -rf ~/Library/Caches/com.apple.dt.Xcode
-
       - name: Build native libraries
         run: |
-          chmod +x build_libs.sh
-          chmod +x develop/build_metallib.sh
-          chmod +x build_ios_libs.sh
-
-          echo "Step 1: Building Rust CLI and static library..."
+          chmod +x build_libs.sh develop/build_metallib.sh build_ios_libs.sh
           ./build_libs.sh
-
-          echo "Step 2: Building Metal libraries..."
           ./develop/build_metallib.sh
-
-          echo "Step 3: Building iOS xcframework..."
           ./build_ios_libs.sh
 
-      - name: Verify generated libraries
+      - name: Verify xcframework
         run: |
-          echo "==== XCFRAMEWORKS ===="
-          find . -name "*.xcframework" -type d
+          ls -lh raw/libsd14raw.xcframework/
+          find raw/libsd14raw.xcframework -type f | head -20
+
+      - name: Build app directly (no archive)
+        run: |
+          xcodebuild build-for-testing \
+            -project app/SigmaDevelop.xcodeproj \
+            -scheme SigmaDevelop \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Find the built app
+        run: |
+          find build/DerivedData -name "SigmaDevelop.app" -type d
+
+      - name: Create IPA from built app
+        run: |
+          APP_PATH=$(find build/DerivedData -name "SigmaDevelop.app" -type d | head -1)
           
-          echo "==== CHECKING XCFRAMEWORK CONTENTS ===="
-          ls -la raw/libsd14raw.xcframework/
-
-          echo
-          echo "==== STATIC LIBRARIES ===="
-          find raw -name "libsd14raw.a" -exec ls -lh {} \;
-
-          echo
-          echo "==== METAL LIBRARIES ===="
-          find . -name "*.metallib" -type f -exec ls -lh {} \;
-
-      - name: Build app with explicit linker settings
-        run: |
-          echo "Building app for iOS..."
-          xcodebuild build \
-            -project app/SigmaDevelop.xcodeproj \
-            -scheme SigmaDevelop \
-            -configuration Release \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath build/DerivedData \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            PROVISIONING_PROFILE="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
-            OTHER_LDFLAGS="-ObjC" \
-            SWIFT_INCLUDE_PATHS="$(pwd)/raw/libsd14raw.xcframework" \
-            2>&1 | tee build.log
-
-      - name: Check build log for errors
-        if: always()
-        run: |
-          echo "==== BUILD LOG (last 100 lines) ===="
-          tail -100 build.log
-
-      - name: Archive unsigned app
-        run: |
-          echo "Creating unsigned archive..."
-          xcodebuild archive \
-            -project app/SigmaDevelop.xcodeproj \
-            -scheme SigmaDevelop \
-            -configuration Release \
-            -destination "generic/platform=iOS" \
-            -archivePath build/SigmaDevelop.xcarchive \
-            -derivedDataPath build/DerivedData \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            PROVISIONING_PROFILE="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
-            OTHER_LDFLAGS="-ObjC" \
-            SWIFT_INCLUDE_PATHS="$(pwd)/raw/libsd14raw.xcframework" \
-            2>&1 | tee archive.log
-
-      - name: Check archive log for errors
-        if: always()
-        run: |
-          echo "==== ARCHIVE LOG (last 100 lines) ===="
-          tail -100 archive.log
-
-      - name: Inspect archive contents
-        run: |
-          APP="build/SigmaDevelop.xcarchive/Products/Applications/SigmaDevelop.app"
-
-          echo "==== CHECKING IF APP EXISTS ===="
-          if [ ! -d "$APP" ]; then
-            echo "ERROR: App not found at $APP"
-            ls -la build/SigmaDevelop.xcarchive/
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: SigmaDevelop.app not found!"
             exit 1
           fi
-
-          echo "==== APP EXECUTABLE ===="
-          if [ -f "$APP/SigmaDevelop" ]; then
-            ls -lh "$APP/SigmaDevelop"
-            file "$APP/SigmaDevelop"
-          else
-            echo "ERROR: SigmaDevelop binary not found!"
-            exit 1
-          fi
-
-          echo
-          echo "==== APP SIZE ===="
-          du -sh "$APP"
-
-      - name: Create IPA from archive
-        run: |
-          echo "Creating IPA from archive..."
-          cd build
-          rm -rf Payload
-          mkdir Payload
-          cp -R SigmaDevelop.xcarchive/Products/Applications/SigmaDevelop.app Payload/
+          
+          echo "Found app at: $APP_PATH"
+          ls -lh "$APP_PATH/"
+          
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/SigmaDevelop.app
           cd Payload
           zip -qry ../SigmaDevelop.ipa .
           cd ..
-          cd ..
-
-          echo "==== IPA CREATED ===="
-          ls -lh build/SigmaDevelop.ipa
+          
+          ls -lh SigmaDevelop.ipa
 
       - name: Verify IPA
         run: |
-          echo "==== IPA INTEGRITY ===="
-          unzip -t build/SigmaDevelop.ipa > /dev/null 2>&1 && echo "✓ IPA is valid" || echo "✗ IPA is corrupted"
-          
-          echo
-          echo "==== IPA SIZE ===="
-          ls -lh build/SigmaDevelop.ipa
+          unzip -t SigmaDevelop.ipa | tail -10
+          ls -lh SigmaDevelop.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: SigmaDevelop-unsigned
-          path: build/SigmaDevelop.ipa
+          path: SigmaDevelop.ipa
           if-no-files-found: error
