@@ -26,16 +26,29 @@ jobs:
           xcodebuild -version
           swift --version
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
+
+      - name: Verify Rust
+        run: |
+          rustc --version
+          cargo --version
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Install Python dependencies
+        run: |
+          pip install numpy scipy pillow
+
       - name: Optional noise profile generation
         run: |
-          pip install numpy scipy
-
           if [ -d dataset ] || ls *.x3f >/dev/null 2>&1; then
+            echo "Building noise profile from dataset..."
             python scripts/noise_profile.py
           else
             echo "Using committed NoiseProfiles.generated.swift"
@@ -47,26 +60,31 @@ jobs:
           chmod +x develop/build_metallib.sh
           chmod +x build_ios_libs.sh
 
+          echo "Step 1: Building Rust CLI and static library..."
           ./build_libs.sh
+
+          echo "Step 2: Building Metal libraries..."
           ./develop/build_metallib.sh
+
+          echo "Step 3: Building iOS xcframework..."
           ./build_ios_libs.sh
 
       - name: Verify generated libraries
         run: |
           echo "==== XCFRAMEWORKS ===="
-          find . -name "*.xcframework"
+          find . -name "*.xcframework" -type d
 
           echo
           echo "==== STATIC LIBRARIES ===="
-          find . -name "*.a"
+          find . -name "libsd14raw.a" 2>/dev/null | head -10
 
           echo
           echo "==== METAL LIBRARIES ===="
-          find . -name "*.metallib"
+          find . -name "*.metallib" -type f
 
           echo
           echo "==== GENERATED RESOURCES ===="
-          find develop/Sources/SigmaFoveon/Resources -type f || true
+          find develop/Sources/SigmaFoveon/Resources -type f 2>/dev/null || echo "No resources found"
 
       - name: Archive unsigned app
         run: |
@@ -76,7 +94,8 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/SigmaDevelop.xcarchive \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            OTHER_LDFLAGS="-ObjC"
 
       - name: Inspect archived app
         run: |
@@ -87,18 +106,24 @@ jobs:
 
           echo
           echo "==== APP CONTENTS ===="
-          find "$APP"
+          find "$APP" -type f | head -20
+
+          echo
+          echo "==== APP EXECUTABLE ===="
+          file "$APP/SigmaDevelop" || echo "Executable not found"
 
       - name: Create IPA
         run: |
-          mkdir Payload
+          mkdir -p Payload
           cp -R build/SigmaDevelop.xcarchive/Products/Applications/SigmaDevelop.app Payload/
           cd Payload
           zip -qry ../SigmaDevelop.ipa .
           cd ..
+          ls -lh SigmaDevelop.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: SigmaDevelop-unsigned
           path: SigmaDevelop.ipa
+          if-no-files-found: error
