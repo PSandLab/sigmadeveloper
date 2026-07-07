@@ -86,32 +86,16 @@ jobs:
           echo "==== GENERATED RESOURCES ===="
           find develop/Sources/SigmaFoveon/Resources -type f 2>/dev/null || echo "No resources found"
 
-      - name: Build SigmaFoveon framework
+      - name: Build SigmaFoveon for development
         run: |
-          echo "Building SigmaFoveon Swift package for iOS..."
+          echo "Building SigmaFoveon framework..."
           cd develop
-          swift build -c release --destination generic/platform=ios
+          swift build -c release
           cd ..
-
-      - name: Build app without signing
-        run: |
-          echo "Building app with unsigned code signing..."
-          xcodebuild build \
-            -project app/SigmaDevelop.xcodeproj \
-            -scheme SigmaDevelop \
-            -configuration Release \
-            -destination "generic/platform=iOS" \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            PROVISIONING_PROFILE="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            OTHER_LDFLAGS="-ObjC -lsd14raw" \
-            IPHONEOS_DEPLOYMENT_TARGET=15.0
 
       - name: Archive unsigned app
         run: |
-          echo "Creating archive..."
+          echo "Creating unsigned archive..."
           xcodebuild archive \
             -project app/SigmaDevelop.xcodeproj \
             -scheme SigmaDevelop \
@@ -123,8 +107,8 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             PROVISIONING_PROFILE="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            OTHER_LDFLAGS="-ObjC -lsd14raw" \
-            IPHONEOS_DEPLOYMENT_TARGET=15.0
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            -verbose
 
       - name: Inspect archive contents
         run: |
@@ -135,8 +119,13 @@ jobs:
 
           echo
           echo "==== APP EXECUTABLE ===="
-          ls -lh "$APP/SigmaDevelop"
-          file "$APP/SigmaDevelop"
+          if [ -f "$APP/SigmaDevelop" ]; then
+            ls -lh "$APP/SigmaDevelop"
+            file "$APP/SigmaDevelop"
+          else
+            echo "ERROR: SigmaDevelop executable not found!"
+            ls -la "$APP/" || echo "App directory not found"
+          fi
 
           echo
           echo "==== APP SIZE ===="
@@ -149,6 +138,10 @@ jobs:
           echo
           echo "==== DYLIBS ===="
           find "$APP" -name "*.dylib" 2>/dev/null || echo "No dylibs"
+
+          echo
+          echo "==== ALL APP CONTENTS ===="
+          find "$APP" -type f | head -50
 
       - name: Create IPA from archive
         run: |
@@ -164,16 +157,19 @@ jobs:
 
           echo "==== IPA CREATED ===="
           ls -lh build/SigmaDevelop.ipa
-          unzip -l build/SigmaDevelop.ipa | head -30
+          
+          echo
+          echo "==== IPA CONTENTS (first 50 entries) ===="
+          unzip -l build/SigmaDevelop.ipa | head -50
 
       - name: Verify IPA structure
         run: |
-          echo "==== IPA STRUCTURE VALIDATION ===="
-          unzip -t build/SigmaDevelop.ipa | tail -5
+          echo "==== IPA INTEGRITY CHECK ===="
+          unzip -t build/SigmaDevelop.ipa 2>&1 | tail -10
 
           echo
-          echo "==== APP BINARY IN IPA ===="
-          unzip -l build/SigmaDevelop.ipa | grep -E "SigmaDevelop|\.dylib|\.framework" | head -20
+          echo "==== CHECKING FOR BINARY ===="
+          unzip -l build/SigmaDevelop.ipa | grep -i "SigmaDevelop$" || echo "Binary not found in IPA!"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
