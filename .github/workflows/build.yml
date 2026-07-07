@@ -8,7 +8,10 @@ jobs:
     runs-on: macos-15
 
     steps:
+      # THE FIX: Tell GitHub Actions to fetch submodules (like spektrafilm)
       - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive' 
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_26.3.app
@@ -21,18 +24,23 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Use a stable python version
+          python-version: '3.11'
 
       - name: Generate Film Sims and Noise Profiles
         run: |
-          # The README specifies these dependencies for the generation scripts
           pip install numpy scipy
           
           # Generates .lut resources + FilmStocks.generated.swift
+          echo "Baking film simulations..."
           python scripts/filmsim_bake.py
           
-          # Generates NoiseProfiles.generated.swift
-          python scripts/noise_profile.py
+          # Safely run noise profile generation (only if dataset exists, to prevent crashes)
+          echo "Checking for noise profile dataset..."
+          if [ -d "dataset" ] || ls *.x3f 1> /dev/null 2>&1; then
+            python scripts/noise_profile.py
+          else
+            echo "No raw dataset found, skipping noise profile re-measurement. (Assuming NoiseProfiles.generated.swift is already committed)"
+          fi
 
       - name: Build Core Dependencies and Shaders
         run: |
@@ -40,13 +48,8 @@ jobs:
           chmod +x develop/build_metallib.sh
           chmod +x build_ios_libs.sh
           
-          # Builds Kalpanika/x3f, libvips, and C/C++ engine dependencies
           ./build_libs.sh
-          
-          # Compiles Metal shaders into a .metallib binary
           ./develop/build_metallib.sh
-          
-          # Bundles everything for iOS architectures
           ./build_ios_libs.sh
 
       - name: Build unsigned app
