@@ -10,8 +10,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: List Xcodes
-        run: ls /Applications | grep Xcode
+      - name: Select Xcode 26.3
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
+      - name: Verify Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          swift --version
 
       - name: Build unsigned app
         run: |
@@ -31,7 +37,13 @@ jobs:
 
       - name: Create IPA
         run: |
-          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "SigmaDevelop.app" | head -n 1)
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "SigmaDevelop.app" -type d | head -n 1)
+
+          if [ -z "$APP" ]; then
+            echo "Could not find SigmaDevelop.app"
+            exit 1
+          fi
+
           mkdir Payload
           cp -R "$APP" Payload/
           zip -qry SigmaDevelop.ipa Payload
