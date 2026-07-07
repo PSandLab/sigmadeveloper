@@ -268,7 +268,7 @@ final class WaveletDenoiseProcessor: CIImageProcessorKernel {
 // MARK: - Metal library
 
 let denoiseMetalLibraryURL: URL? = {
-    #if os(macOS)
+    #if os(macOS) || targetEnvironment(macCatalyst)
     let name = "Denoise_macos"
     #elseif targetEnvironment(simulator)
     let name = "Denoise_iossim"

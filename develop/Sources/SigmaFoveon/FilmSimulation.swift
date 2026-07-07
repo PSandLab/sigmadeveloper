@@ -381,7 +381,7 @@ final class FilmSimProcessor: CIImageProcessorKernel {
 // MARK: - Metal library
 
 let filmSimMetalLibraryURL: URL? = {
-    #if os(macOS)
+    #if os(macOS) || targetEnvironment(macCatalyst)
     let name = "FilmSim_macos"
     #elseif targetEnvironment(simulator)
     let name = "FilmSim_iossim"

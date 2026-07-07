@@ -12,7 +12,7 @@ import Foundation
 /// The platform-appropriate finishing metallib bytes, loaded once. nil (with a stderr
 /// note) if the resource is missing — each dependent kernel then silently no-ops.
 let foveonMetalLibrary: Data? = {
-    #if os(macOS)
+    #if os(macOS) || targetEnvironment(macCatalyst)
     let name = "LensCorrection_macos.ci"
     #elseif targetEnvironment(simulator)
     let name = "LensCorrection_iossim.ci"

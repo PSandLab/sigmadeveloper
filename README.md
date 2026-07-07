@@ -42,7 +42,22 @@ Various industry raw files are also supported, through apple's raw library, & us
 ./develop/.build/release/foveon testx3f/ -o out --tiff --heic
 ```
 
-Or open `app/` in Xcode & run on an iPhone of choice (iPadOS, MacOS untested)
+
+Or open `app/` in Xcode & run on an iPhone of choice
+App also builds for Mac Catalyst & iPadOS, but is not the highest priority, use at your own risk, soemthing like that
+
+```sh
+./export_app.sh                 # ad-hoc .ipa + .app -> build/export
+./export_app.sh --ios           # just the .ipa
+./export_app.sh --catalyst      # just the .app
+./export_app.sh --method developer-id   # notarizable standalone build
+
+# Ship to TestFlight
+ASC_KEY_ID=XXXXXXXXXX \
+ASC_ISSUER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+ASC_KEY_PATH=~/keys/AuthKey_XXXXXXXXXX.p8 \
+./export_app.sh --upload
+```
 
 ```
 usage: foveon <input> [options]
