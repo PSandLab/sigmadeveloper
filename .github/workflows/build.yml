@@ -11,7 +11,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-          lfs: true # <--- THIS IS THE FIX!
+          lfs: true
+
+      - name: Pull LFS for submodules
+        run: git submodule foreach git lfs pull # <--- THIS FORCES LFS DOWNLOAD IN SPEKTRAFILM
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_26.3.app
