@@ -54,6 +54,11 @@ jobs:
             echo "Using committed NoiseProfiles.generated.swift"
           fi
 
+      - name: Clean Xcode cache
+        run: |
+          rm -rf ~/Library/Developer/Xcode/DerivedData/*
+          rm -rf ~/Library/Caches/com.apple.dt.Xcode
+
       - name: Build native libraries
         run: |
           chmod +x build_libs.sh
@@ -73,25 +78,42 @@ jobs:
         run: |
           echo "==== XCFRAMEWORKS ===="
           find . -name "*.xcframework" -type d
+          
+          echo "==== CHECKING XCFRAMEWORK CONTENTS ===="
+          ls -la raw/libsd14raw.xcframework/
 
           echo
           echo "==== STATIC LIBRARIES ===="
-          find . -name "libsd14raw.a" 2>/dev/null
+          find raw -name "libsd14raw.a" -exec ls -lh {} \;
 
           echo
           echo "==== METAL LIBRARIES ===="
-          find . -name "*.metallib" -type f
+          find . -name "*.metallib" -type f -exec ls -lh {} \;
 
-          echo
-          echo "==== GENERATED RESOURCES ===="
-          find develop/Sources/SigmaFoveon/Resources -type f 2>/dev/null || echo "No resources found"
-
-      - name: Build SigmaFoveon for development
+      - name: Build app with explicit linker settings
         run: |
-          echo "Building SigmaFoveon framework..."
-          cd develop
-          swift build -c release
-          cd ..
+          echo "Building app for iOS..."
+          xcodebuild build \
+            -project app/SigmaDevelop.xcodeproj \
+            -scheme SigmaDevelop \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            OTHER_LDFLAGS="-ObjC" \
+            SWIFT_INCLUDE_PATHS="$(pwd)/raw/libsd14raw.xcframework" \
+            2>&1 | tee build.log
+
+      - name: Check build log for errors
+        if: always()
+        run: |
+          echo "==== BUILD LOG (last 100 lines) ===="
+          tail -100 build.log
 
       - name: Archive unsigned app
         run: |
@@ -102,74 +124,70 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/SigmaDevelop.xcarchive \
+            -derivedDataPath build/DerivedData \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             PROVISIONING_PROFILE="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
             IPHONEOS_DEPLOYMENT_TARGET=15.0 \
-            -verbose
+            OTHER_LDFLAGS="-ObjC" \
+            SWIFT_INCLUDE_PATHS="$(pwd)/raw/libsd14raw.xcframework" \
+            2>&1 | tee archive.log
+
+      - name: Check archive log for errors
+        if: always()
+        run: |
+          echo "==== ARCHIVE LOG (last 100 lines) ===="
+          tail -100 archive.log
 
       - name: Inspect archive contents
         run: |
           APP="build/SigmaDevelop.xcarchive/Products/Applications/SigmaDevelop.app"
 
-          echo "App path:"
-          echo "$APP"
+          echo "==== CHECKING IF APP EXISTS ===="
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: App not found at $APP"
+            ls -la build/SigmaDevelop.xcarchive/
+            exit 1
+          fi
 
-          echo
           echo "==== APP EXECUTABLE ===="
           if [ -f "$APP/SigmaDevelop" ]; then
             ls -lh "$APP/SigmaDevelop"
             file "$APP/SigmaDevelop"
           else
-            echo "ERROR: SigmaDevelop executable not found!"
-            ls -la "$APP/" || echo "App directory not found"
+            echo "ERROR: SigmaDevelop binary not found!"
+            exit 1
           fi
 
           echo
           echo "==== APP SIZE ===="
           du -sh "$APP"
 
-          echo
-          echo "==== FRAMEWORKS EMBEDDED ===="
-          find "$APP/Frameworks" -type f 2>/dev/null || echo "No frameworks found"
-
-          echo
-          echo "==== DYLIBS ===="
-          find "$APP" -name "*.dylib" 2>/dev/null || echo "No dylibs"
-
-          echo
-          echo "==== ALL APP CONTENTS ===="
-          find "$APP" -type f | head -50
-
       - name: Create IPA from archive
         run: |
           echo "Creating IPA from archive..."
           cd build
-          mkdir -p Payload
+          rm -rf Payload
+          mkdir Payload
           cp -R SigmaDevelop.xcarchive/Products/Applications/SigmaDevelop.app Payload/
           cd Payload
           zip -qry ../SigmaDevelop.ipa .
           cd ..
-          rm -rf Payload
           cd ..
 
           echo "==== IPA CREATED ===="
           ls -lh build/SigmaDevelop.ipa
+
+      - name: Verify IPA
+        run: |
+          echo "==== IPA INTEGRITY ===="
+          unzip -t build/SigmaDevelop.ipa > /dev/null 2>&1 && echo "✓ IPA is valid" || echo "✗ IPA is corrupted"
           
           echo
-          echo "==== IPA CONTENTS (first 50 entries) ===="
-          unzip -l build/SigmaDevelop.ipa | head -50
-
-      - name: Verify IPA structure
-        run: |
-          echo "==== IPA INTEGRITY CHECK ===="
-          unzip -t build/SigmaDevelop.ipa 2>&1 | tail -10
-
-          echo
-          echo "==== CHECKING FOR BINARY ===="
-          unzip -l build/SigmaDevelop.ipa | grep -i "SigmaDevelop$" || echo "Binary not found in IPA!"
+          echo "==== IPA SIZE ===="
+          ls -lh build/SigmaDevelop.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
