@@ -10,11 +10,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: recursive
           lfs: true
 
-      - name: Pull LFS for submodules
-        run: git submodule foreach git lfs pull # <--- THIS FORCES LFS DOWNLOAD IN SPEKTRAFILM
+      - name: Pull Git LFS for submodules
+        run: |
+          git lfs pull
+          git submodule foreach --recursive git lfs pull || true
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_26.3.app
@@ -27,60 +29,76 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Generate Film Sims and Noise Profiles
+      - name: Optional noise profile generation
         run: |
           pip install numpy scipy
-          
-          # Generates .lut resources + FilmStocks.generated.swift
-          echo "Baking film simulations..."
-          python scripts/filmsim_bake.py
-          
-          # Safely run noise profile generation
-          echo "Checking for noise profile dataset..."
-          if [ -d "dataset" ] || ls *.x3f 1> /dev/null 2>&1; then
+
+          if [ -d dataset ] || ls *.x3f >/dev/null 2>&1; then
             python scripts/noise_profile.py
           else
-            echo "No raw dataset found, skipping noise profile re-measurement."
+            echo "Using committed NoiseProfiles.generated.swift"
           fi
 
-      - name: Build Core Dependencies and Shaders
+      - name: Build native libraries
         run: |
           chmod +x build_libs.sh
           chmod +x develop/build_metallib.sh
           chmod +x build_ios_libs.sh
-          
+
           ./build_libs.sh
           ./develop/build_metallib.sh
           ./build_ios_libs.sh
 
-      - name: Build unsigned app
+      - name: Verify generated libraries
         run: |
-          xcodebuild \
+          echo "==== XCFRAMEWORKS ===="
+          find . -name "*.xcframework"
+
+          echo
+          echo "==== STATIC LIBRARIES ===="
+          find . -name "*.a"
+
+          echo
+          echo "==== METAL LIBRARIES ===="
+          find . -name "*.metallib"
+
+          echo
+          echo "==== GENERATED RESOURCES ===="
+          find develop/Sources/SigmaFoveon/Resources -type f || true
+
+      - name: Archive unsigned app
+        run: |
+          xcodebuild archive \
             -project app/SigmaDevelop.xcodeproj \
             -scheme SigmaDevelop \
             -configuration Release \
-            -sdk iphoneos \
-            -destination generic/platform=iOS \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            clean build
+            -destination "generic/platform=iOS" \
+            -archivePath build/SigmaDevelop.xcarchive \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Inspect archived app
+        run: |
+          APP="build/SigmaDevelop.xcarchive/Products/Applications/SigmaDevelop.app"
+
+          echo "App path:"
+          echo "$APP"
+
+          echo
+          echo "==== APP CONTENTS ===="
+          find "$APP"
 
       - name: Create IPA
         run: |
-          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "SigmaDevelop.app" -type d | head -n 1)
-
           mkdir Payload
-          cp -R "$APP" Payload/
-          zip -qry SigmaDevelop.ipa Payload
+          cp -R build/SigmaDevelop.xcarchive/Products/Applications/SigmaDevelop.app Payload/
+          cd Payload
+          zip -qry ../SigmaDevelop.ipa .
+          cd ..
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: SigmaDevelop-ipa
+          name: SigmaDevelop-unsigned
           path: SigmaDevelop.ipa
