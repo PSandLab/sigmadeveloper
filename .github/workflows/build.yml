@@ -18,9 +18,16 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: Build iOS libraries
+      - name: Build dependencies and libraries
         run: |
+          # Make scripts executable
+          chmod +x build_libs.sh
+          chmod +x develop/build_metallib.sh
           chmod +x build_ios_libs.sh
+          
+          # Run the build scripts in the required sequence
+          ./build_libs.sh
+          ./develop/build_metallib.sh
           ./build_ios_libs.sh
 
       - name: Build unsigned app
