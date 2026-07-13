@@ -189,12 +189,7 @@ struct DetailView: View {
                     tile: zoomTile,
                     insetH: SigmaTheme.stageInsetH,
                     insetV: SigmaTheme.stageInsetV,
-                    onTileNeeded: previewIsNativeRes ? nil : handleTileRequest,
-                    onBackSwipe: {
-                        #if os(macOS)
-                        dismiss()
-                        #endif
-                    }
+                    onTileNeeded: previewIsNativeRes ? nil : handleTileRequest
                 )
             } else if let thumb = store.thumbnails[item.id] {
                 Image(decorative: thumb, scale: 1)

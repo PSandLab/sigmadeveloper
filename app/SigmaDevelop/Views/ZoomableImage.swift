@@ -123,7 +123,6 @@ struct ZoomableImage: UIViewRepresentable {
     var insetH: CGFloat = 0
     var insetV: CGFloat = 0
     var onTileNeeded: ((ZoomTileRequest?) -> Void)? = nil
-    var onBackSwipe: (() -> Void)? = nil
 
     private let maxScale: CGFloat = 6
     private let doubleTapScale: CGFloat = 2.5
@@ -395,7 +394,6 @@ struct ZoomableImage: NSViewRepresentable {
     var insetH: CGFloat = 0
     var insetV: CGFloat = 0
     var onTileNeeded: ((ZoomTileRequest?) -> Void)? = nil
-    var onBackSwipe: (() -> Void)? = nil
 
     private let maxScale: CGFloat = 6
     private let doubleClickScale: CGFloat = 2.5
@@ -422,7 +420,6 @@ struct ZoomableImage: NSViewRepresentable {
         scrollView.onInteractionEnded = { [weak coordinator = context.coordinator] in
             coordinator?.maybeRequestTile()
         }
-        scrollView.onBackSwipe = onBackSwipe
 
         let doubleClick = NSClickGestureRecognizer(
             target: context.coordinator,
@@ -453,7 +450,6 @@ struct ZoomableImage: NSViewRepresentable {
         coordinator.maxScale = maxScale
         coordinator.doubleClickScale = doubleClickScale
         coordinator.onTileNeeded = onTileNeeded
-        scrollView.onBackSwipe = onBackSwipe
         coordinator.imageView.preferredImageDynamicRange = isHDR ? .high : .standard
 
         if imageChanged {
@@ -610,7 +606,6 @@ final class CenteringClipView: NSClipView {
 final class MacZoomScrollView: NSScrollView {
     var onLayout: ((CGSize) -> Void)?
     var onInteractionEnded: (() -> Void)?
-    var onBackSwipe: (() -> Void)?
 
     override func layout() {
         super.layout()
@@ -623,17 +618,12 @@ final class MacZoomScrollView: NSScrollView {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        // At 1× the document fits — ignore pan so the photo cannot drift in
+        // the letterbox. Pinch still arrives via `magnify(with:)`.
         if magnification <= minMagnification + 0.001,
-           event.phase == .began,
-           event.scrollingDeltaX > 0,
-           abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY),
-           NSEvent.isSwipeTrackingFromScrollEventsEnabled,
-           let onBackSwipe {
-            event.trackSwipeEvent(options: .lockDirection,
-                                  dampenAmountThresholdMin: -1, max: 1) {
-                amount, phase, _, _ in
-                if phase == .ended, amount >= 0.3 { onBackSwipe() }
-            }
+           let doc = documentView?.frame.size,
+           doc.width <= contentView.bounds.width + 0.5,
+           doc.height <= contentView.bounds.height + 0.5 {
             return
         }
         super.scrollWheel(with: event)

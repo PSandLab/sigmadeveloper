@@ -11,48 +11,22 @@ private struct Disclosure<Content: View>: View {
     @ViewBuilder var content: Content
 
     @State private var measured: CGFloat = 0
-    @State private var height: CGFloat?
-
-    init(shown: Bool, @ViewBuilder content: () -> Content) {
-        self.shown = shown
-        self.content = content()
-        _height = State(initialValue: shown ? nil : 0) // adopt initial state, no opening animation
-    }
 
     var body: some View {
         VStack(spacing: 0) { content }
             .fixedSize(horizontal: false, vertical: true)
-            // Pin to the proposed width so hidden rows (long stock-menu labels) can't
-            // inflate the panel sideways.
+            // Proposed width only — long menu labels must not widen the rail.
             .frame(minWidth: 0, maxWidth: .infinity)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { measured = $0 }
-            .frame(height: height, alignment: .top)
-            // Clip the *height* only. `.clipped()` also trims the horizontal bounds,
-            // shaving the trailing edge of flush controls (Toggle switch, segmented
-            // track) — visible on these clipped rows but not the unclipped top-level
-            // ones. The over-hanging mask keeps the height clip (an opening menu still
-            // can't draw over its neighbours) while leaving the sides untouched.
+            // Full content height while open (intrinsic until first measure); 0 when closed.
+            .frame(height: shown ? (measured > 0 ? measured : nil) : 0, alignment: .top)
+            // Spring only on `shown` flips. Nested resize is silent. Stock rewrites
+            // that set `disablesAnimations` skip the spring entirely.
+            .animation(revealAnimation(forHeight: measured), value: shown)
+            // Height clip without shaving trailing controls (Toggle, segmented).
             .mask(alignment: .top) { Rectangle().padding(.horizontal, -40) }
-            // Reveal purely by unmasking height (like a native List/Form insertion).
-            // No opacity cross-fade: fading the already-unclipped rows makes them
-            // ghost in from the top instead of unrolling solid.
             .allowsHitTesting(shown)
             .accessibilityHidden(!shown)
-            .onChange(of: shown) { _, nowShown in
-                if nowShown {
-                    // Unroll 0 → content height, then hand sizing back to the content.
-                    withAnimation(revealAnimation(forHeight: measured)) { height = measured } completion: {
-                        if shown { height = nil }
-                    }
-                } else {
-                    // A frame can't animate away from `nil`, so pin the live height for
-                    // one pass (no visible change — it equals the natural height), then
-                    // roll it up to 0.
-                    withAnimation(.linear(duration: 0)) { height = measured } completion: {
-                        withAnimation(revealAnimation(forHeight: measured)) { height = 0 }
-                    }
-                }
-            }
     }
 }
 
@@ -549,9 +523,7 @@ private struct FilmControl: View {
         }
     }
 
-    /// Apply a stock and its companion process in one transaction. An
-    /// `onChange` performed this rewrite one layout pass later, allowing the
-    /// menu-dismiss animation to briefly lay out several intermediate values.
+    /// Stock + companion process (paper / scan / halation) in one write.
     private var filmSelection: Binding<Int> {
         Binding(
             get: { film.film },
@@ -560,68 +532,81 @@ private struct FilmControl: View {
     }
 }
 
+/// Film / paper row. Long stock names need a truncating label — plain
+/// `Picker(.menu)` sizes to content and overflows the rail on macOS.
 private struct StockPicker: View {
     let title: String
     @Binding var selection: Int
     let stocks: [FilmStock]
 
+    private var selectedName: String {
+        stocks.first { $0.index == selection }?.name ?? ""
+    }
+
+    /// Suppresses layout animation on companion rewrites (paper, halation, …).
+    private var steadySelection: Binding<Int> {
+        Binding(
+            get: { selection },
+            set: { new in
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) { selection = new }
+            }
+        )
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             Text(title)
-                .layoutPriority(1)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            Spacer(minLength: 8)
+
             Menu {
-                ForEach(stocks) { stock in
-                    Button {
-                        steadySelection.wrappedValue = stock.index
-                    } label: {
-                        if stock.index == selection {
-                            Label(stock.name, systemImage: "checkmark")
-                        } else {
-                            Text(stock.name)
-                        }
-                    }
+                // Inline picker → flat list with system checkmarks (not a submenu).
+                Picker(title, selection: steadySelection) {
+                    ForEach(stocks) { Text($0.name).tag($0.index) }
                 }
+                .labelsHidden()
+                .pickerStyle(.inline)
             } label: {
-                Text(stocks.first { $0.index == selection }?.name ?? "")
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: 200, alignment: .trailing)
+                menuLabel
             }
-            .tint(SigmaTheme.ink)
+            #if os(macOS)
+            .menuStyle(.borderlessButton)
             .menuIndicator(.visible)
-            #if os(iOS)
-            // Stable outer geometry prevents UIKit's menu-dismiss transition
-            // from remeasuring every differently-sized stock name.
-            .frame(width: 220, alignment: .trailing)
             #else
-            // On macOS retain the native intrinsic popup width; forcing the
-            // iOS width leaves an unnatural empty run before the indicator.
-            .fixedSize(horizontal: true, vertical: false)
+            .menuIndicator(.hidden)
             #endif
+            .tint(SigmaTheme.ink)
+            // Flexible trailing slot: truncates long names, stable across selections.
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .trailing)
             .transaction { $0.disablesAnimations = true }
         }
         .padding(.vertical, 13)
         .disabledRowStyle()
     }
 
-    /// Writes the selection inside a no-animation transaction. A menu
-    /// selection otherwise lands inside the menu-dismiss transaction, whose
-    /// implicit animation rides every dependent relayout — a film switch
-    /// rewrites paper/negative/halation, and the panel wobbles until it
-    /// settles. Structural reveals still animate: `Disclosure` drives its own
-    /// explicit springs.
-    private var steadySelection: Binding<Int> {
-        Binding(
-            get: { selection },
-            set: { new in
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) { selection = new }
-            }
-        )
+    @ViewBuilder
+    private var menuLabel: some View {
+        #if os(macOS)
+        // Text only — chevron Images are re-hosted leading by AppKit.
+        Text(selectedName)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        #else
+        // Trailing secondary chevron (UIKit-style disclosure).
+        HStack(spacing: 4) {
+            Text(selectedName)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Image(systemName: "chevron.up.chevron.down")
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .contentShape(Rectangle())
+        #endif
     }
 }
 
