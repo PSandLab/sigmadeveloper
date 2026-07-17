@@ -9,59 +9,27 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          lfs: true
 
-      - name: Pull Git LFS for submodules
-        run: |
-          git lfs pull
-          git submodule foreach --recursive git lfs pull || true
+      - name: List available Xcode versions
+        run: ls /Applications | grep Xcode
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_26.3.app
-
-      - name: Verify Xcode
-        run: |
-          xcodebuild -version
-          swift --version
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app  # confirm from step above
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-ios-macabi,x86_64-apple-ios-macabi
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Python dependencies
-        run: pip install numpy scipy pillow
-
-      - name: Optional noise profile generation
+      - name: Build native libs (Rust xcframework + metallibs)
         run: |
-          if [ -d dataset ] || ls *.x3f >/dev/null 2>&1; then
-            python scripts/noise_profile.py
-          else
-            echo "Using committed NoiseProfiles.generated.swift"
-          fi
-
-      - name: Build native libraries
-        run: |
-          chmod +x build_libs.sh develop/build_metallib.sh build_ios_libs.sh
-          ./build_libs.sh
-          ./develop/build_metallib.sh
+          chmod +x build_ios_libs.sh develop/build_metallib.sh
           ./build_ios_libs.sh
+          ./develop/build_metallib.sh
 
-      - name: Verify xcframework
+      - name: Build app (unsigned)
         run: |
-          ls -lh raw/libsd14raw.xcframework/
-          find raw/libsd14raw.xcframework -type f | head -20
-
-      - name: Build app directly (no archive)
-        run: |
-          xcodebuild build-for-testing \
+          xcodebuild build \
             -project app/SigmaDevelop.xcodeproj \
             -scheme SigmaDevelop \
             -configuration Release \
@@ -71,33 +39,13 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Find the built app
-        run: |
-          find build/DerivedData -name "SigmaDevelop.app" -type d
-
-      - name: Create IPA from built app
+      - name: Package IPA
         run: |
           APP_PATH=$(find build/DerivedData -name "SigmaDevelop.app" -type d | head -1)
-          
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: SigmaDevelop.app not found!"
-            exit 1
-          fi
-          
-          echo "Found app at: $APP_PATH"
-          ls -lh "$APP_PATH/"
-          
+          [ -n "$APP_PATH" ] || { echo "app not found"; exit 1; }
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/SigmaDevelop.app
-          cd Payload
-          zip -qry ../SigmaDevelop.ipa .
-          cd ..
-          
-          ls -lh SigmaDevelop.ipa
-
-      - name: Verify IPA
-        run: |
-          unzip -t SigmaDevelop.ipa | tail -10
+          zip -qry SigmaDevelop.ipa Payload
           ls -lh SigmaDevelop.ipa
 
       - name: Upload IPA
