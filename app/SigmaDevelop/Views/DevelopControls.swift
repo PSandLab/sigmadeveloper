@@ -11,48 +11,22 @@ private struct Disclosure<Content: View>: View {
     @ViewBuilder var content: Content
 
     @State private var measured: CGFloat = 0
-    @State private var height: CGFloat?
-
-    init(shown: Bool, @ViewBuilder content: () -> Content) {
-        self.shown = shown
-        self.content = content()
-        _height = State(initialValue: shown ? nil : 0) // adopt initial state, no opening animation
-    }
 
     var body: some View {
         VStack(spacing: 0) { content }
             .fixedSize(horizontal: false, vertical: true)
-            // Pin to the proposed width so hidden rows (long stock-menu labels) can't
-            // inflate the panel sideways.
+            // Proposed width only — long menu labels must not widen the rail.
             .frame(minWidth: 0, maxWidth: .infinity)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { measured = $0 }
-            .frame(height: height, alignment: .top)
-            // Clip the *height* only. `.clipped()` also trims the horizontal bounds,
-            // shaving the trailing edge of flush controls (Toggle switch, segmented
-            // track) — visible on these clipped rows but not the unclipped top-level
-            // ones. The over-hanging mask keeps the height clip (an opening menu still
-            // can't draw over its neighbours) while leaving the sides untouched.
+            // Full content height while open (intrinsic until first measure); 0 when closed.
+            .frame(height: shown ? (measured > 0 ? measured : nil) : 0, alignment: .top)
+            // Spring only on `shown` flips. Nested resize is silent. Stock rewrites
+            // that set `disablesAnimations` skip the spring entirely.
+            .animation(revealAnimation(forHeight: measured), value: shown)
+            // Height clip without shaving trailing controls (Toggle, segmented).
             .mask(alignment: .top) { Rectangle().padding(.horizontal, -40) }
-            // Reveal purely by unmasking height (like a native List/Form insertion).
-            // No opacity cross-fade: fading the already-unclipped rows makes them
-            // ghost in from the top instead of unrolling solid.
             .allowsHitTesting(shown)
             .accessibilityHidden(!shown)
-            .onChange(of: shown) { _, nowShown in
-                if nowShown {
-                    // Unroll 0 → content height, then hand sizing back to the content.
-                    withAnimation(revealAnimation(forHeight: measured)) { height = measured } completion: {
-                        if shown { height = nil }
-                    }
-                } else {
-                    // A frame can't animate away from `nil`, so pin the live height for
-                    // one pass (no visible change — it equals the natural height), then
-                    // roll it up to 0.
-                    withAnimation(.linear(duration: 0)) { height = measured } completion: {
-                        withAnimation(revealAnimation(forHeight: measured)) { height = 0 }
-                    }
-                }
-            }
     }
 }
 
@@ -163,7 +137,7 @@ struct DevelopControls: View {
         .tint(SigmaTheme.ink)
         .onAppear {
             if settings.hdr && !settings.autoTone {
-                settings.autoTone = true
+                settings.setHDREnabled(true)
                 hdrEnabledAutoTone = true
             }
         }
@@ -173,13 +147,15 @@ struct DevelopControls: View {
         Binding(
             get: { settings.hdr },
             set: { enabled in
-                settings.hdr = enabled
                 if enabled {
                     hdrEnabledAutoTone = !settings.autoTone
-                    settings.autoTone = true
+                    settings.setHDREnabled(true)
                 } else if hdrEnabledAutoTone {
+                    settings.setHDREnabled(false)
                     settings.autoTone = false
                     hdrEnabledAutoTone = false
+                } else {
+                    settings.setHDREnabled(false)
                 }
             }
         )
@@ -392,10 +368,11 @@ private struct DenoiseControl: View {
 }
 
 private extension DenoiseMode {
+    /// Short labels so the middle segmented-control cell stays legible
     var label: String {
         switch self {
         case .off: "Off"
-        case .wavelet: "Profiled"
+        case .wavelet: "Profile"
         case .neural: "Neural"
         }
     }
@@ -473,7 +450,7 @@ private struct FilmControl: View {
 
             Disclosure(shown: enabled) {
                 Divider()
-                StockPicker(title: "Film", selection: $film.film, stocks: FilmSimData.films)
+                StockPicker(title: "Film", selection: filmSelection, stocks: FilmSimData.films)
 
                 Divider()
                 StockPicker(title: "Paper", selection: $film.paper, stocks: FilmSimData.papers)
@@ -544,45 +521,248 @@ private struct FilmControl: View {
                 }
             }
         }
-        .onChange(of: film.film) { _, new in
-            // A stock implies its process: companion paper (or scanned positive),
-            // halation character, and a fresh neutral enlarger balance.
-            film = film.selecting(film: new)
-        }
     }
 
+    /// Stock + companion process (paper / scan / halation) in one write.
+    private var filmSelection: Binding<Int> {
+        Binding(
+            get: { film.film },
+            set: { film = film.selecting(film: $0) }
+        )
+    }
 }
 
+/// Film / paper row. Long stock names need a truncating label — plain
+/// `Picker(.menu)` sizes to content and overflows the rail on macOS.
 private struct StockPicker: View {
     let title: String
     @Binding var selection: Int
     let stocks: [FilmStock]
 
+    private var selectedName: String {
+        stocks.first { $0.index == selection }?.name ?? ""
+    }
+
+    /// Suppresses layout animation on companion rewrites (paper, halation, …).
+    private var steadySelection: Binding<Int> {
+        Binding(
+            get: { selection },
+            set: { new in
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) { selection = new }
+            }
+        )
+    }
+
     var body: some View {
-        // stock menu will overrun
-        let name = stocks.first { $0.index == selection }?.name ?? ""
         HStack(spacing: 12) {
             Text(title)
-                .layoutPriority(1)
-            Spacer(minLength: 8)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+
             Menu {
-                Picker(title, selection: $selection) {
+                // Inline picker → flat list with system checkmarks (not a submenu).
+                Picker(title, selection: steadySelection) {
                     ForEach(stocks) { Text($0.name).tag($0.index) }
                 }
+                .labelsHidden()
+                .pickerStyle(.inline)
             } label: {
-                HStack(spacing: 4) {
-                    Text(name)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .imageScale(.small)
-                        .foregroundStyle(.secondary)
-                }
+                menuLabel
             }
+            #if os(macOS)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.visible)
+            #else
+            .menuIndicator(.hidden)
+            #endif
             .tint(SigmaTheme.ink)
+            // Flexible trailing slot: truncates long names, stable across selections.
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .trailing)
+            .transaction { $0.disablesAnimations = true }
         }
         .padding(.vertical, 13)
-        // disable paper for slides etc.
         .disabledRowStyle()
+    }
+
+    @ViewBuilder
+    private var menuLabel: some View {
+        #if os(macOS)
+        // Text only — chevron Images are re-hosted leading by AppKit.
+        Text(selectedName)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        #else
+        // Trailing secondary chevron (UIKit-style disclosure).
+        HStack(spacing: 4) {
+            Text(selectedName)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Image(systemName: "chevron.up.chevron.down")
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .contentShape(Rectangle())
+        #endif
+    }
+}
+
+// MARK: - Develop panel chrome
+
+private struct DevelopRailActiveKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+private struct ToggleDevelopRailActionKey: EnvironmentKey {
+    static let defaultValue: () -> Void = {}
+}
+
+extension EnvironmentValues {
+    /// True when the develop panel (inspector / rail) is on-screen.
+    var developRailActive: Bool {
+        get { self[DevelopRailActiveKey.self] }
+        set { self[DevelopRailActiveKey.self] = newValue }
+    }
+
+    /// Shows or hides the develop panel; no-op where it is unavailable.
+    var toggleDevelopRail: () -> Void {
+        get { self[ToggleDevelopRailActionKey.self] }
+        set { self[ToggleDevelopRailActionKey.self] = newValue }
+    }
+}
+
+/// Shared “Develop” title row — sheet, rail, and phone tray.
+struct DevelopHeaderBar: View {
+    var onReset: (() -> Void)? = nil
+    var onDone: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text("Develop")
+                .font(.headline)
+                .foregroundStyle(SigmaTheme.ink)
+            Spacer(minLength: 0)
+            if let onReset {
+                // Bare ink glyph — no chip behind the arrow.
+                Button(action: onReset) {
+                    Label("Reset", systemImage: "arrow.counterclockwise")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .tint(SigmaTheme.ink)
+                .accessibilityLabel("Reset")
+            }
+            if let onDone {
+                Button("Done", action: onDone)
+                    .buttonStyle(.glass)
+                    .tint(SigmaTheme.ink)
+            }
+        }
+    }
+}
+
+/// Global defaults body (controls + export format).
+struct DevelopDefaultsForm: View {
+    @Binding var settings: DevelopSettings
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            DevelopControls(settings: $settings, isX3F: true)
+
+            Divider()
+
+            HStack {
+                Text("Default format")
+                Spacer()
+                Picker("Default format", selection: $settings.exportFormat) {
+                    ForEach(ExportFormat.allCases) { Text($0.label).tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+            }
+            .font(.body)
+            .padding(.vertical, 8)
+        }
+        .padding(.horizontal, 4)
+    }
+}
+
+/// Vertical rule between the stage and the rail — run up through the toolbar
+/// band on iOS; on macOS it stays below the window toolbar like a standard
+/// panel separator.
+struct DevelopColumnDivider: View {
+    var body: some View {
+        #if os(iOS)
+        Rectangle()
+            .fill(SigmaTheme.hairline)
+            .frame(width: 1)
+            .ignoresSafeArea(edges: .top)
+        #else
+        Rectangle()
+            .fill(.separator)
+            .frame(width: 1)
+        #endif
+    }
+}
+
+/// The persistent develop panel: live editor controls while editing, global
+/// defaults otherwise. Only this panel carries the paper/ink theme — window
+/// chrome stays native.
+struct DevelopRail: View {
+    @Environment(LibraryStore.self) private var store
+    @Environment(DevelopSession.self) private var session
+
+    var body: some View {
+        @Bindable var store = store
+        @Bindable var session = session
+
+        VStack(spacing: 0) {
+            #if os(iOS)
+            SigmaWordmark(height: 16)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
+                .padding(.bottom, 10)
+            #endif
+            VStack(spacing: 10) {
+                DevelopHeaderBar(onReset: session.isEditing
+                    ? { session.settings = .init() }
+                    : { store.defaults = DevelopSettings() })
+                ScrollView {
+                    if session.isEditing {
+                        DevelopControls(
+                            settings: $session.settings,
+                            isX3F: session.isX3F,
+                            autoExposureEV: session.autoExposureEV,
+                            lensCorrectionAvailable: session.lensProfileAvailable
+                        )
+                        .padding(.horizontal, 4)
+                    } else {
+                        DevelopDefaultsForm(settings: $store.defaults)
+                    }
+                }
+                .scrollIndicators(.never)
+                #if os(iOS)
+                .scrollEdgeEffectHidden(true, for: .all)
+                #endif
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
+            .padding(.bottom, 12)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .foregroundStyle(SigmaTheme.ink)
+        .tint(SigmaTheme.ink)
+        #if os(macOS)
+        .background(SigmaTheme.paper)
+        #else
+        .background(SigmaTheme.paper.ignoresSafeArea(edges: .top))
+        #endif
+        // Stable identity across library ↔ editor so SwiftUI does not rebuild
+        // the paper surface (the classic “sidebar loses color” remount glitch).
+        .id("develop-rail")
     }
 }
